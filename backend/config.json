@@ -1,0 +1,8 @@
+{
+  "staticDir": "../dist",
+  "database": {
+    "db": "DomainChecker",
+    "dbType": "sqlite",
+    "connectionString": "./databases/DomainChecker.db"
+  }
+}

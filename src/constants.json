@@ -1,0 +1,47 @@
+{
+    "version": "0.1.0",
+    "appName": "Domain Checker",
+    "appIcon": "globe",
+    "tagline": "Private domain availability lookup",
+    "cta": "Get Started",
+    "noLogin": true,
+    "authOverlay": false,
+    "sidebarCollapsed": true,
+    "features": {
+        "title": "Why Use This?",
+        "items": [
+            {
+                "icon": "search",
+                "title": "Private Search",
+                "description": "Direct WHOIS/RDAP lookups — no middleman, no logging"
+            },
+            {
+                "icon": "shield",
+                "title": "No Front-Running",
+                "description": "Your searches are never stored or shared with third parties"
+            },
+            {
+                "icon": "bolt",
+                "title": "Instant Results",
+                "description": "Concurrent checks across 12 TLDs in milliseconds"
+            }
+        ]
+    },
+    "backendURL": "/api",
+    "devBackendURL": "http://localhost:8000/api",
+    "pages": [
+        {
+            "title": "Search",
+            "url": "home",
+            "icon": "search"
+        }
+    ],
+    "stripeProducts": [],
+    "companyName": "Domain Checker",
+    "companyWebsite": "localhost",
+    "companyEmail": "support@example.com",
+    "termsOfService": "",
+    "subscriptionDetails": "",
+    "privacyPolicy": "",
+    "EULA": ""
+}
