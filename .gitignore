@@ -45,3 +45,4 @@ backend/.env
 
 MIGRATION_GUIDE-0.9.8.md
 SKATEBOARD_UI_EXTENSIONS_PROPOSAL.md
+railway.json

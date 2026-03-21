@@ -397,11 +397,11 @@ app.use('*', async (c, next) => {
 app.use('*', secureHeaders({
   contentSecurityPolicy: {
     defaultSrc: ["'self'"],
-    scriptSrc: ["'self'", "'unsafe-inline'"],
+    scriptSrc: ["'self'", "'unsafe-inline'", "https://static.cloudflareinsights.com"],
     styleSrc: ["'self'", "'unsafe-inline'"],
     imgSrc: ["'self'", "data:"],
     fontSrc: ["'self'"],
-    connectSrc: isDevelopment ? ["'self'", "http://localhost:8000"] : ["'self'"],
+    connectSrc: isDevelopment ? ["'self'", "http://localhost:8000"] : ["'self'", "https://cloudflareinsights.com"],
     frameAncestors: ["'none'"]
   },
   strictTransportSecurity: isDevelopment ? false : 'max-age=31536000; includeSubDomains; preload',
@@ -1395,7 +1395,7 @@ app.use('*', async (c, next) => {
   }
 
   // Try to serve static file
-  const staticMiddleware = serveStatic({ root: config.staticDir });
+  const staticMiddleware = serveStatic({ root: staticDir });
   return staticMiddleware(c, next);
 });
 

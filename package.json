@@ -1,7 +1,7 @@
 {
   "name": "domain-checker",
   "private": false,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "skateboardVersion": "2.2.2",
   "type": "module",
   "workspaces": [

@@ -27,9 +27,9 @@ ENV NODE_ENV=production
 # Copy built frontend
 COPY --from=builder /app/dist ./dist
 
-# Copy backend
+# Copy backend and root node_modules (workspaces hoist deps to root)
 COPY --from=builder /app/backend ./backend
-COPY --from=builder /app/backend/node_modules ./backend/node_modules
+COPY --from=builder /app/node_modules ./node_modules
 
 # Copy package files
 COPY package*.json ./
@@ -45,5 +45,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
   CMD node -e "fetch('http://localhost:8000/api/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
 
+WORKDIR /app/backend
+
 # Run server
-CMD ["node", "--experimental-sqlite", "backend/server.js"]
+CMD ["node", "--experimental-sqlite", "server.js"]

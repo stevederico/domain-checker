@@ -1,5 +1,11 @@
 ## CHANGELOG
 
+0.2.0
+
+  Fix static file MIME types
+  Add CSP cloudflare insights
+  Fix Dockerfile workdir
+
 2.2.2
 
   Update version 2.2.2
