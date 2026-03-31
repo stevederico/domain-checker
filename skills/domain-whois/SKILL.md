@@ -1,7 +1,7 @@
 ---
 name: domain-whois
 description: Check domain name availability across 12 TLDs via direct WHOIS/RDAP lookups. No external service needed. Use when the user asks about domain availability, wants to find a domain name, or mentions registering a domain.
-compatibility: Requires whois CLI (built into macOS) and curl for .dev/.app RDAP lookups.
+compatibility: Requires bash, whois CLI (built into macOS, install via apt on Linux), and curl.
 metadata:
   author: stevederico
   version: "1.0"

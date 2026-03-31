@@ -1,6 +1,7 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 # Check domain availability across TLDs via direct WHOIS/RDAP
 # Usage: check.sh <domain>
+# Requires: whois, curl
 
 DOMAIN=$(echo "$1" | tr '[:upper:]' '[:lower:]')
 DOMAIN="${DOMAIN%%.*}" # strip TLD if provided
@@ -18,7 +19,8 @@ fi
 tmpdir=$(mktemp -d)
 
 check_whois() {
-  local tld=$1 server=$2
+  local tld="$1"
+  local server="$2"
   local fqdn="${DOMAIN}.${tld}"
   local result lower
 
@@ -35,7 +37,7 @@ check_whois() {
 }
 
 check_rdap() {
-  local tld=$1
+  local tld="$1"
   local fqdn="${DOMAIN}.${tld}"
   local http_code
 
@@ -69,22 +71,18 @@ check_rdap app > "$tmpdir/app" &
 
 wait
 
-# Collect and sort results
-available=()
-taken=()
-unknown=()
-
+# Collect and sort results (available first, then taken, then unknown)
 for f in "$tmpdir"/*; do
   line=$(cat "$f")
-  case "$line" in
-    *"|Available") available+=("$line") ;;
-    *"|Taken") taken+=("$line") ;;
-    *) unknown+=("$line") ;;
-  esac
+  case "$line" in *"|Available") echo "$line" ;; esac
+done
+for f in "$tmpdir"/*; do
+  line=$(cat "$f")
+  case "$line" in *"|Taken") echo "$line" ;; esac
+done
+for f in "$tmpdir"/*; do
+  line=$(cat "$f")
+  case "$line" in *"|Unknown") echo "$line" ;; esac
 done
 
 rm -rf "$tmpdir"
-
-for line in "${available[@]}" "${taken[@]}" "${unknown[@]}"; do
-  echo "$line"
-done
