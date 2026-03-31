@@ -63,6 +63,7 @@ The `domain` field is the base name only (no TLD). Alphanumeric and hyphens only
 ```bash
 curl -s -X POST https://checker.bixbyapps.com/api/check \
   -H "Content-Type: application/json" \
+  -A "Claude-Agent" \
   -d '{"domain": "example"}'
 ```
 
