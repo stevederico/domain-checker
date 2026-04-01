@@ -1,5 +1,9 @@
 ## CHANGELOG
 
+0.3.0
+
+  Add domain-checker agent skill
+
 0.2.0
 
   Fix static file MIME types
