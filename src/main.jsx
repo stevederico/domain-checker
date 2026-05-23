@@ -8,7 +8,7 @@
  */
 import './assets/styles.css';
 import { createSkateboardApp } from '@stevederico/skateboard-ui/App';
-import { Navigate } from 'react-router-dom';
+import { Navigate } from 'react-router';
 import constants from './constants.json';
 import HomeView from './components/HomeView.jsx';
 
