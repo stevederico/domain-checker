@@ -1,5 +1,11 @@
 ## CHANGELOG
 
+0.4.0
+
+  Bump skateboard 3.4.0
+  Drop unused deps
+  Migrate to react-router
+
 0.3.0
 
   Add domain-checker agent skill
