@@ -6,8 +6,7 @@ import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { secureHeaders } from 'hono/secure-headers'
 import { cors } from 'hono/cors'
 import Stripe from "stripe";
-import jwt from "jsonwebtoken";
-import bcrypt from "bcryptjs";
+import { compare as legacyBcryptCompare } from "./vendor/legacy-bcrypt.js";
 import crypto from "crypto";
 
 import { databaseManager } from "./adapters/manager.js";
@@ -427,32 +426,61 @@ app.use('*', async (c, next) => {
 
 const tokenExpirationDays = 30;
 
+const scryptAsync = promisify(crypto.scrypt);
+const SCRYPT_KEYLEN = 64;
+const SCRYPT_SALTLEN = 16;
+
 /**
- * Hash password using bcrypt with 10 salt rounds
+ * Hash password using node:crypto scrypt
  *
- * Generates salt and hashes password for secure storage. Uses bcrypt's
- * automatic salt generation.
+ * Format: `scrypt$<base64url salt>$<base64url key>`. New hashes always use
+ * scrypt; legacy bcrypt hashes (prefix `$2`) are verified via the dispatch
+ * in verifyPassword but never created.
  *
  * @async
  * @param {string} password - Plain text password to hash
- * @returns {Promise<string>} Bcrypt hashed password
- * @throws {Error} If bcrypt hashing fails
+ * @returns {Promise<string>} Scrypt hash string
  */
 async function hashPassword(password) {
-  const salt = await bcrypt.genSalt(10);
-  return await bcrypt.hash(password, salt);
+  const salt = crypto.randomBytes(SCRYPT_SALTLEN);
+  const key = await scryptAsync(password, salt, SCRYPT_KEYLEN);
+  return `scrypt$${salt.toString('base64url')}$${key.toString('base64url')}`;
 }
 
 /**
- * Verify password against bcrypt hash using timing-safe comparison
+ * Verify password against stored hash (scrypt or legacy bcrypt)
+ *
+ * Dispatches on stored hash prefix: `scrypt$` → native scrypt verify;
+ * `$2` → bcryptjs (legacy users predating the scrypt migration).
  *
  * @async
  * @param {string} password - Plain text password to verify
- * @param {string} hash - Bcrypt hash to compare against
- * @returns {Promise<boolean>} True if password matches hash
+ * @param {string} stored - Stored hash (scrypt or bcrypt format)
+ * @returns {Promise<boolean>} True if password matches stored hash
  */
-async function verifyPassword(password, hash) {
-  return await bcrypt.compare(password, hash);
+async function verifyPassword(password, stored) {
+  if (typeof stored !== 'string') return false;
+  if (stored.startsWith('scrypt$')) {
+    const [, saltB64, keyB64] = stored.split('$');
+    const salt = Buffer.from(saltB64, 'base64url');
+    const expected = Buffer.from(keyB64, 'base64url');
+    const candidate = await scryptAsync(password, salt, SCRYPT_KEYLEN);
+    return expected.length === candidate.length && crypto.timingSafeEqual(expected, candidate);
+  }
+  if (stored.startsWith('$2')) {
+    return await legacyBcryptCompare(password, stored);
+  }
+  return false;
+}
+
+/**
+ * Whether a stored hash should be migrated to scrypt on next successful login
+ *
+ * @param {string} stored - Stored hash
+ * @returns {boolean} True if the hash is in legacy bcrypt format
+ */
+function needsRehash(stored) {
+  return typeof stored === 'string' && !stored.startsWith('scrypt$');
 }
 
 /**
@@ -462,6 +490,56 @@ async function verifyPassword(password, hash) {
  */
 function tokenExpireTimestamp(){
   return Math.floor(Date.now() / 1000) + tokenExpirationDays * 24 * 60 * 60; // 30 days from now
+}
+
+/**
+ * Sign an HS256 JWT using node:crypto HMAC-SHA256
+ *
+ * Produces a token byte-compatible with jsonwebtoken: header
+ * {"alg":"HS256","typ":"JWT"} followed by the payload, joined and signed
+ * over `base64url(header).base64url(payload)`.
+ *
+ * @param {Object} payload - Payload to encode (must include exp)
+ * @param {string} secret - HMAC signing secret
+ * @returns {string} Compact JWT string
+ */
+function jwtSign(payload, secret) {
+  const head = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');
+  return `${head}.${body}.${sig}`;
+}
+
+/**
+ * Verify an HS256 JWT and return its payload
+ *
+ * Compatible with tokens issued by jsonwebtoken (same algorithm, same secret).
+ * Throws an Error with name === 'TokenExpiredError' for expired tokens, or a
+ * generic Error for malformed/invalid signatures.
+ *
+ * @param {string} token - JWT string to verify
+ * @param {string} secret - HMAC verification secret
+ * @returns {Object} Decoded payload
+ * @throws {Error} If token is malformed, signature invalid, or expired
+ */
+function jwtVerify(token, secret) {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Invalid token');
+  const [head, body, sig] = parts;
+  if (!head || !body || !sig) throw new Error('Invalid token');
+  const expected = crypto.createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');
+  const sigBuf = Buffer.from(sig);
+  const expBuf = Buffer.from(expected);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    throw new Error('Invalid signature');
+  }
+  const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+  if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+    const err = new Error('Token expired');
+    err.name = 'TokenExpiredError';
+    throw err;
+  }
+  return payload;
 }
 
 /**
@@ -484,10 +562,7 @@ async function generateToken(userID) {
     const exp = tokenExpireTimestamp();
     const payload = { userID, exp };
 
-    return jwt.sign(payload, JWT_SECRET, {
-      algorithm: 'HS256',
-      header: { alg: "HS256", typ: "JWT" }
-    });
+    return jwtSign(payload, JWT_SECRET);
   } catch (error) {
     logger.error('Token generation error', { error: error.message });
     throw error;
@@ -519,7 +594,7 @@ async function authMiddleware(c, next) {
   }
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET, { algorithms: ["HS256"] });
+    const payload = jwtVerify(token, JWT_SECRET);
     // Normalize userID to string for consistent Map key usage (CSRF, sessions)
     const normalizedUserID = String(payload.userID);
     c.set('userID', normalizedUserID);
@@ -780,6 +855,20 @@ app.post("/api/signin", async (c) => {
     if (!(await verifyPassword(password, auth.password))) {
       logger.debug('Password verification failed');
       return c.json({ error: "Invalid credentials" }, 401);
+    }
+
+    // Lazy migrate legacy bcrypt hash to scrypt (best-effort, never blocks login)
+    if (needsRehash(auth.password)) {
+      try {
+        const newHash = await hashPassword(password);
+        await databaseManager.executeQuery(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, {
+          query: 'UPDATE Auths SET password = ? WHERE email = ?',
+          params: [newHash, email]
+        });
+        logger.debug('Password hash migrated to scrypt');
+      } catch (e) {
+        logger.warn('Password rehash failed', { error: e.message });
+      }
     }
 
     // get user
