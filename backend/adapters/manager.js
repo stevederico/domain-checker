@@ -1,6 +1,4 @@
 import { SQLiteProvider } from './sqlite.js';
-import { PostgreSQLProvider } from './postgres.js';
-import { MongoDBProvider } from './mongodb.js';
 
 /**
  * Database manager implementing factory pattern for multi-database support
@@ -41,13 +39,17 @@ class DatabaseManager {
           provider = new SQLiteProvider();
           break;
         case 'postgresql':
-        case 'postgres':
+        case 'postgres': {
+          const { PostgreSQLProvider } = await import('./postgres.js');
           provider = new PostgreSQLProvider();
           break;
+        }
         case 'mongodb':
-        case 'mongo':
+        case 'mongo': {
+          const { MongoDBProvider } = await import('./mongodb.js');
           provider = new MongoDBProvider();
           break;
+        }
         default:
           throw new Error(`Unsupported database type: ${dbType}`);
       }
@@ -187,6 +189,66 @@ class DatabaseManager {
   async insertAuth(dbType, dbName, connectionString, authData) {
     const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
     return await provider.insertAuth(database, authData);
+  }
+
+  /**
+   * Update authentication record (currently password only)
+   *
+   * Used by lazy password-hash migration on successful login.
+   *
+   * @async
+   * @param {string} dbType - Database type
+   * @param {string} dbName - Database name
+   * @param {string} connectionString - Connection string or file path
+   * @param {Object} query - Query object with email
+   * @param {string} query.email - Email of auth record to update
+   * @param {Object} update - Fields to update
+   * @param {string} [update.password] - New password hash
+   * @returns {Promise<{modifiedCount: number}>} Number of modified rows
+   */
+  async updateAuth(dbType, dbName, connectionString, query, update) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.updateAuth(database, query, update);
+  }
+
+  /**
+   * Find webhook event by event ID for idempotency check
+   *
+   * Checks if a Stripe webhook event has already been processed to prevent
+   * duplicate processing on retries.
+   *
+   * @async
+   * @param {string} dbType - Database type
+   * @param {string} dbName - Database name
+   * @param {string} connectionString - Connection string or file path
+   * @param {string} eventId - Stripe event ID to check
+   * @returns {Promise<Object|null>} Webhook event record or null if not processed
+   * @throws {Error} If database operation fails
+   */
+  async findWebhookEvent(dbType, dbName, connectionString, eventId) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.findWebhookEvent(database, eventId);
+  }
+
+  /**
+   * Insert webhook event record for idempotency tracking
+   *
+   * Records that a Stripe webhook event has been processed to prevent
+   * duplicate processing on retries.
+   *
+   * @async
+   * @param {string} dbType - Database type
+   * @param {string} dbName - Database name
+   * @param {string} connectionString - Connection string or file path
+   * @param {string} eventId - Stripe event ID (unique)
+   * @param {string} eventType - Stripe event type
+   * @param {number} processedAt - Unix timestamp when processed
+   * @returns {Promise<Object>} Inserted event record
+   * @throws {Error} If database operation fails
+   */
+  async insertWebhookEvent(dbType, dbName, connectionString, eventId, eventType, processedAt) {
+    const { provider, database } = await this.getDatabase(dbType, dbName, connectionString);
+    return await provider.insertWebhookEvent(database, eventId, eventType, processedAt);
   }
 
   /**

@@ -33,7 +33,7 @@ export class MongoDBProvider {
    * @returns {Promise<void>}
    */
   async initialize() {
-    console.log('MongoDB provider initialized');
+    // Provider ready for connections
   }
 
   /**
@@ -101,6 +101,12 @@ export class MongoDBProvider {
       await db.createCollection('Auths');
       // Create unique index on email
       await db.collection('Auths').createIndex({ email: 1 }, { unique: true });
+    }
+
+    if (!collectionNames.includes('WebhookEvents')) {
+      await db.createCollection('WebhookEvents');
+      // Create unique index on event_id
+      await db.collection('WebhookEvents').createIndex({ event_id: 1 }, { unique: true });
     }
   }
 
@@ -205,6 +211,56 @@ export class MongoDBProvider {
    */
   async insertAuth(db, authData) {
     const result = await db.collection('Auths').insertOne(authData);
+    return { insertedId: result.insertedId };
+  }
+
+  /**
+   * Update authentication document (password only)
+   *
+   * @async
+   * @param {Db} db - MongoDB database instance
+   * @param {Object} query - Query object with email
+   * @param {string} query.email - Email of auth document to update
+   * @param {Object} update - Fields to update
+   * @param {string} update.password - New password hash
+   * @returns {Promise<{modifiedCount: number}>} Number of modified documents
+   */
+  async updateAuth(db, query, update) {
+    const { email } = query;
+    const { password } = update;
+    if (typeof password !== 'string') return { modifiedCount: 0 };
+    const result = await db.collection('Auths').updateOne({ email }, { $set: { password } });
+    return { modifiedCount: result.modifiedCount };
+  }
+
+  /**
+   * Find webhook event by event ID for idempotency check
+   *
+   * @async
+   * @param {Db} db - MongoDB database instance
+   * @param {string} eventId - Stripe event ID
+   * @returns {Promise<Object|null>} Webhook event document or null if not found
+   */
+  async findWebhookEvent(db, eventId) {
+    return await db.collection('WebhookEvents').findOne({ event_id: eventId });
+  }
+
+  /**
+   * Insert webhook event record for idempotency tracking
+   *
+   * @async
+   * @param {Db} db - MongoDB database instance
+   * @param {string} eventId - Stripe event ID (unique)
+   * @param {string} eventType - Stripe event type
+   * @param {number} processedAt - Unix timestamp
+   * @returns {Promise<{insertedId: ObjectId}>} MongoDB insertedId
+   */
+  async insertWebhookEvent(db, eventId, eventType, processedAt) {
+    const result = await db.collection('WebhookEvents').insertOne({
+      event_id: eventId,
+      event_type: eventType,
+      processed_at: processedAt
+    });
     return { insertedId: result.insertedId };
   }
 

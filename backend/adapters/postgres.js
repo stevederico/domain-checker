@@ -32,7 +32,7 @@ export class PostgreSQLProvider {
    * @returns {Promise<void>}
    */
   async initialize() {
-    console.log('PostgreSQL provider initialized');
+    // Provider ready for connections
   }
 
   /**
@@ -120,6 +120,15 @@ export class PostgreSQLProvider {
       // Create indexes
       await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
       await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_auths_email ON auths(email)`);
+
+      // Create webhook_events table for idempotency
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS webhook_events (
+          event_id TEXT PRIMARY KEY,
+          event_type TEXT NOT NULL,
+          processed_at BIGINT NOT NULL
+        )
+      `);
 
     } finally {
       client.release();
@@ -335,11 +344,77 @@ export class PostgreSQLProvider {
   async insertAuth(pool, authData) {
     const { email, password, userID } = authData;
     const sql = 'INSERT INTO auths (email, password, "userID") VALUES ($1, $2, $3)';
-    
+
     const client = await pool.connect();
     try {
       await client.query(sql, [email, password, userID]);
       return { insertedId: email };
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Update authentication record (password only)
+   *
+   * @async
+   * @param {pg.Pool} pool - PostgreSQL connection pool
+   * @param {Object} query - Query object with email
+   * @param {string} query.email - Email of auth record to update
+   * @param {Object} update - Fields to update
+   * @param {string} update.password - New password hash
+   * @returns {Promise<{modifiedCount: number}>} Number of modified rows
+   */
+  async updateAuth(pool, query, update) {
+    const { email } = query;
+    const { password } = update;
+    if (typeof password !== 'string') return { modifiedCount: 0 };
+    const sql = "UPDATE auths SET password = $1 WHERE email = $2";
+
+    const client = await pool.connect();
+    try {
+      const result = await client.query(sql, [password, email]);
+      return { modifiedCount: result.rowCount };
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Find webhook event by event ID for idempotency check
+   *
+   * @async
+   * @param {pg.Pool} pool - PostgreSQL connection pool
+   * @param {string} eventId - Stripe event ID
+   * @returns {Promise<Object|null>} Webhook event record or null if not found
+   */
+  async findWebhookEvent(pool, eventId) {
+    const sql = "SELECT * FROM webhook_events WHERE event_id = $1";
+    const client = await pool.connect();
+    try {
+      const result = await client.query(sql, [eventId]);
+      return result.rows.length > 0 ? result.rows[0] : null;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Insert webhook event record for idempotency tracking
+   *
+   * @async
+   * @param {pg.Pool} pool - PostgreSQL connection pool
+   * @param {string} eventId - Stripe event ID (unique)
+   * @param {string} eventType - Stripe event type
+   * @param {number} processedAt - Unix timestamp
+   * @returns {Promise<{insertedId: string}>} Inserted event ID
+   */
+  async insertWebhookEvent(pool, eventId, eventType, processedAt) {
+    const sql = "INSERT INTO webhook_events (event_id, event_type, processed_at) VALUES ($1, $2, $3)";
+    const client = await pool.connect();
+    try {
+      await client.query(sql, [eventId, eventType, processedAt]);
+      return { insertedId: eventId };
     } finally {
       client.release();
     }
