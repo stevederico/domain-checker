@@ -14,11 +14,54 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFile, mkdir, stat, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { promisify } from 'node:util';
-import dns from 'node:dns';
-import net from 'node:net';
 
 // ==== SERVER CONFIG ====
 const port = parseInt(process.env.PORT || "8000");
+
+// ==== STRUCTURED LOGGING ====
+// Defined early so all code can use it (no external dependencies)
+const logger = {
+  error: (message, meta = {}) => {
+    const logEntry = {
+      level: 'ERROR',
+      timestamp: new Date().toISOString(),
+      message,
+      ...meta
+    };
+    console.error(!isProd() ? JSON.stringify(logEntry, null, 2) : JSON.stringify(logEntry));
+  },
+
+  warn: (message, meta = {}) => {
+    const logEntry = {
+      level: 'WARN',
+      timestamp: new Date().toISOString(),
+      message,
+      ...meta
+    };
+    console.warn(!isProd() ? JSON.stringify(logEntry, null, 2) : JSON.stringify(logEntry));
+  },
+
+  info: (message, meta = {}) => {
+    const logEntry = {
+      level: 'INFO',
+      timestamp: new Date().toISOString(),
+      message,
+      ...meta
+    };
+    console.log(!isProd() ? JSON.stringify(logEntry, null, 2) : JSON.stringify(logEntry));
+  },
+
+  debug: (message, meta = {}) => {
+    if (isProd()) return;
+    const logEntry = {
+      level: 'DEBUG',
+      timestamp: new Date().toISOString(),
+      message,
+      ...meta
+    };
+    console.log(JSON.stringify(logEntry, null, 2));
+  }
+};
 
 // ==== CSRF PROTECTION ====
 const csrfTokenStore = new Map(); // userID -> { token, timestamp }
@@ -28,8 +71,8 @@ const CSRF_MAX_ENTRIES = 50000; // LRU eviction threshold
 /**
  * LRU eviction helper that removes oldest entries when over limit
  *
- * Prevents memory leaks in rate limiter and CSRF stores by removing oldest
- * entries based on timestamp when store exceeds maxEntries threshold.
+ * Prevents memory leaks in CSRF store by removing oldest entries based on
+ * timestamp when store exceeds maxEntries threshold.
  *
  * @param {Map} store - Map to evict entries from
  * @param {number} maxEntries - Maximum entries before eviction
@@ -87,7 +130,7 @@ async function csrfProtection(c, next) {
     logger.info('CSRF validation failed - missing token or userID', {
       hasToken: !!csrfToken,
       hasUserID: !!userID,
-      path: redactPath(c.req.path)
+      path: c.req.path
     });
     return c.json({ error: 'Invalid CSRF token' }, 403);
   }
@@ -102,7 +145,7 @@ async function csrfProtection(c, next) {
 
     setCookie(c, 'csrf_token', newToken, {
       httpOnly: false,
-      secure: !isDevelopment,
+      secure: isProd(),
       sameSite: 'Lax',
       path: '/',
       maxAge: CSRF_TOKEN_EXPIRY / 1000
@@ -119,7 +162,7 @@ async function csrfProtection(c, next) {
   if (tokenBuffer.length !== storedBuffer.length || !crypto.timingSafeEqual(tokenBuffer, storedBuffer)) {
     logger.info('CSRF validation failed - token mismatch', {
       userID,
-      path: redactPath(c.req.path)
+      path: c.req.path
     });
     return c.json({ error: 'Invalid CSRF token' }, 403);
   }
@@ -154,9 +197,96 @@ setInterval(() => {
   evictOldestEntries(csrfTokenStore, CSRF_MAX_ENTRIES, (data) => data.timestamp);
 
   if (cleaned > 0) {
-    console.log(`[${new Date().toISOString()}] CSRF cleanup: removed ${cleaned} expired tokens`);
+    logger.debug('CSRF cleanup completed', { removedTokens: cleaned });
   }
 }, 60 * 60 * 1000); // Run every hour
+
+// ==== ACCOUNT LOCKOUT ====
+const loginAttemptStore = new Map(); // email -> { attempts, lockedUntil }
+const LOCKOUT_THRESHOLD = 5; // Lock after 5 failed attempts
+const LOCKOUT_DURATION = 15 * 60 * 1000; // 15 minutes
+const LOCKOUT_MAX_ENTRIES = 50000; // LRU eviction threshold
+
+/**
+ * Check if account is locked due to failed login attempts
+ *
+ * @param {string} email - Email address to check
+ * @returns {{locked: boolean, remainingTime: number}} Lock status and remaining time in seconds
+ */
+function isAccountLocked(email) {
+  const record = loginAttemptStore.get(email);
+  if (!record) return { locked: false, remainingTime: 0 };
+
+  const now = Date.now();
+  if (record.lockedUntil && now < record.lockedUntil) {
+    return {
+      locked: true,
+      remainingTime: Math.ceil((record.lockedUntil - now) / 1000)
+    };
+  }
+
+  // Lock expired, clear record
+  if (record.lockedUntil && now >= record.lockedUntil) {
+    loginAttemptStore.delete(email);
+  }
+
+  return { locked: false, remainingTime: 0 };
+}
+
+/**
+ * Record a failed login attempt for an email
+ *
+ * Increments attempt counter. Locks account after LOCKOUT_THRESHOLD failures.
+ *
+ * @param {string} email - Email address that failed login
+ * @returns {void}
+ */
+function recordFailedLogin(email) {
+  const now = Date.now();
+  let record = loginAttemptStore.get(email);
+
+  if (!record) {
+    record = { attempts: 0, lockedUntil: null };
+    loginAttemptStore.set(email, record);
+  }
+
+  record.attempts++;
+
+  if (record.attempts >= LOCKOUT_THRESHOLD) {
+    record.lockedUntil = now + LOCKOUT_DURATION;
+    logger.info('Account locked due to failed attempts', { email: email.substring(0, 3) + '***' });
+  }
+}
+
+/**
+ * Clear failed login attempts on successful login
+ *
+ * @param {string} email - Email address to clear
+ * @returns {void}
+ */
+function clearFailedLogins(email) {
+  loginAttemptStore.delete(email);
+}
+
+// Cleanup expired lockout entries every 15 minutes
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+
+  for (const [email, record] of loginAttemptStore.entries()) {
+    if (record.lockedUntil && now >= record.lockedUntil) {
+      loginAttemptStore.delete(email);
+      cleaned++;
+    }
+  }
+
+  // LRU eviction if still over limit
+  evictOldestEntries(loginAttemptStore, LOCKOUT_MAX_ENTRIES, (data) => data.lockedUntil || 0);
+
+  if (cleaned > 0) {
+    logger.debug('Lockout cleanup completed', { removedEntries: cleaned });
+  }
+}, 15 * 60 * 1000);
 
 // ==== CONFIG & ENV ====
 // Environment setup - MUST happen before config loading
@@ -164,7 +294,7 @@ if (!isProd()) {
   loadLocalENV();
 } else {
   setInterval(async () => {
-    console.log(`Hourly Completed at ${new Date().toLocaleTimeString()}`);
+    logger.debug('Hourly task completed');
   }, 60 * 60 * 1000); // Every hour
 }
 
@@ -183,7 +313,7 @@ function resolveEnvironmentVariables(str) {
   return str.replace(/\$\{([^}]+)\}/g, (match, varName) => {
     const envValue = process.env[varName];
     if (envValue === undefined) {
-      console.warn(`Environment variable ${varName} is not defined, using placeholder: ${match}`);
+      logger.warn('Environment variable not defined, using placeholder', { varName, placeholder: match });
       return match; // Return the placeholder if env var is not found
     }
     return envValue;
@@ -208,7 +338,7 @@ try {
     }
   };
 } catch (err) {
-  console.error('Failed to load config:', err);
+  logger.error('Failed to load config, using defaults', { error: err.message });
   config = {
     staticDir: '../dist',
     database: {
@@ -252,15 +382,10 @@ function validateEnvironmentVariables() {
   }
 
   if (missing.length > 0) {
-    console.warn("⚠️  Missing environment variables (server will continue with limited functionality):");
-    missing.forEach(varName => console.warn(`   - ${varName}`));
-    console.warn("\n💡 For full functionality, set these environment variables:");
-    console.warn("   - DATABASE_URL (general database connection)");
-    console.warn("   - MONGODB_URL (MongoDB connection)");
-    console.warn("   - POSTGRES_URL (PostgreSQL connection)");
-    console.warn("   - STRIPE_KEY (Stripe payments)");
-    console.warn("   - JWT_SECRET (authentication)");
-    console.warn("\n🔄 Server continuing with fallback/default values...\n");
+    logger.warn('Missing environment variables - server continuing with limited functionality', {
+      missing,
+      hint: 'Set DATABASE_URL, MONGODB_URL, POSTGRES_URL, STRIPE_KEY, JWT_SECRET for full functionality'
+    });
 
     // Don't exit - let the server continue with warnings
     return false;
@@ -272,76 +397,10 @@ function validateEnvironmentVariables() {
 const envValidationPassed = validateEnvironmentVariables();
 
 if (envValidationPassed) {
-  console.log('✅ Environment variables validated successfully');
+  logger.info('Environment variables validated successfully');
 }
 
-console.log('Single-client backend initialized');
-
-// Development mode check
-const isDevelopment = process.env.NODE_ENV !== 'production';
-
-// Structured logging system (no external dependencies)
-const logger = {
-  error: (message, meta = {}) => {
-    const logEntry = {
-      level: 'ERROR',
-      timestamp: new Date().toISOString(),
-      message,
-      ...meta
-    };
-    console.error(isDevelopment ? JSON.stringify(logEntry, null, 2) : JSON.stringify(logEntry));
-  },
-
-  warn: (message, meta = {}) => {
-    const logEntry = {
-      level: 'WARN',
-      timestamp: new Date().toISOString(),
-      message,
-      ...meta
-    };
-    console.warn(isDevelopment ? JSON.stringify(logEntry, null, 2) : JSON.stringify(logEntry));
-  },
-
-  info: (message, meta = {}) => {
-    const logEntry = {
-      level: 'INFO',
-      timestamp: new Date().toISOString(),
-      message,
-      ...meta
-    };
-    console.log(isDevelopment ? JSON.stringify(logEntry, null, 2) : JSON.stringify(logEntry));
-  },
-
-  debug: (message, meta = {}) => {
-    if (!isDevelopment) return;
-    const logEntry = {
-      level: 'DEBUG',
-      timestamp: new Date().toISOString(),
-      message,
-      ...meta
-    };
-    console.log(JSON.stringify(logEntry, null, 2));
-  }
-};
-
-/**
- * Redact domain query data from request paths
- *
- * Strips query parameters from /api/check paths to prevent domain names
- * from appearing in server logs. Other paths are returned unchanged.
- *
- * @param {string} path - Request path to redact
- * @returns {string} Redacted path
- */
-function redactPath(path) {
-  if (path.startsWith('/api/check')) return '/api/check';
-  return path;
-}
-
-// Log server initialization
-logger.info('Server initialization started', {
-  environment: isDevelopment ? 'development' : 'production'
-});
+logger.info('Single-client backend initialized');
 
 // ==== DATABASE CONFIG ====
 // Single database configuration - no origin-based routing needed
@@ -353,11 +412,36 @@ let stripe = null;
 if (STRIPE_KEY) {
   stripe = new Stripe(STRIPE_KEY);
 } else {
-  console.warn('⚠️  STRIPE_KEY not set - Stripe functionality will be disabled');
+  logger.warn('STRIPE_KEY not set - Stripe functionality disabled');
 }
 
 // Single database config - always use the same one
 const currentDbConfig = dbConfig;
+
+/**
+ * Database helper with pre-bound configuration
+ *
+ * Provides shorthand methods for database operations without repeating
+ * dbType, db, connectionString on every call.
+ *
+ * @type {Object}
+ * @example
+ * // Instead of:
+ * await db.findUser( { email });
+ * // Use:
+ * await db.findUser({ email });
+ */
+const db = {
+  findUser: (query, projection) => databaseManager.findUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, query, projection),
+  insertUser: (userData) => databaseManager.insertUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, userData),
+  updateUser: (query, update) => databaseManager.updateUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, query, update),
+  findAuth: (query) => databaseManager.findAuth(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, query),
+  insertAuth: (authData) => databaseManager.insertAuth(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, authData),
+  updateAuth: (query, update) => databaseManager.updateAuth(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, query, update),
+  findWebhookEvent: (eventId) => databaseManager.findWebhookEvent(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, eventId),
+  insertWebhookEvent: (eventId, eventType, processedAt) => databaseManager.insertWebhookEvent(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, eventId, eventType, processedAt),
+  executeQuery: (queryObject) => databaseManager.executeQuery(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, queryObject)
+};
 
 // ==== HONO SETUP ====
 const app = new Hono();
@@ -389,24 +473,24 @@ app.use('*', async (c, next) => {
   const status = c.res.status;
   const duration = Date.now() - start;
 
-  console.log(`[${timestamp}] "${method} ${redactPath(url)}" ${status} (${duration}ms)`);
+  console.log(`[${timestamp}] "${method} ${url}" ${status} (${duration}ms)`);
 });
 
 // Security headers middleware
 app.use('*', secureHeaders({
   contentSecurityPolicy: {
     defaultSrc: ["'self'"],
-    scriptSrc: ["'self'", "'unsafe-inline'", "https://static.cloudflareinsights.com"],
+    scriptSrc: ["'self'", "'unsafe-inline'"],
     styleSrc: ["'self'", "'unsafe-inline'"],
-    imgSrc: ["'self'", "data:"],
+    imgSrc: ["'self'", "https:"],
     fontSrc: ["'self'"],
-    connectSrc: isDevelopment ? ["'self'", "http://localhost:8000"] : ["'self'", "https://cloudflareinsights.com"],
+    connectSrc: ["'self'"],
     frameAncestors: ["'none'"]
   },
-  strictTransportSecurity: isDevelopment ? false : 'max-age=31536000; includeSubDomains; preload',
+  strictTransportSecurity: !isProd() ? false : 'max-age=31536000; includeSubDomains; preload',
   xFrameOptions: 'DENY',
   xContentTypeOptions: 'nosniff',
-  referrerPolicy: 'no-referrer',
+  referrerPolicy: 'strict-origin-when-cross-origin',
   permissionsPolicy: {
     camera: [],
     microphone: [],
@@ -417,9 +501,9 @@ app.use('*', secureHeaders({
 
 // Request logging middleware (dev only)
 app.use('*', async (c, next) => {
-  if (isDevelopment) {
+  if (!isProd()) {
     const requestId = Math.random().toString(36).substr(2, 9);
-    console.log(`[${new Date().toISOString()}] ${c.req.method} ${redactPath(c.req.path)} - ID: ${requestId}`);
+    logger.debug('Request received', { method: c.req.method, path: c.req.path, requestId });
   }
   await next();
 });
@@ -692,7 +776,94 @@ const validateName = (name) => {
   return true;
 };
 
+/**
+ * Set authentication cookies and generate CSRF token for user session
+ *
+ * Creates CSRF token, stores it in memory, and sets both JWT (HttpOnly) and
+ * CSRF (readable) cookies. Consolidates duplicate cookie logic from signup/signin.
+ *
+ * @async
+ * @param {Context} c - Hono context
+ * @param {string} userID - User ID to associate with session
+ * @param {string} jwtToken - Pre-generated JWT token
+ * @returns {string} Generated CSRF token
+ */
+function setAuthCookies(c, userID, jwtToken) {
+  const csrfToken = generateCSRFToken();
+  csrfTokenStore.set(userID.toString(), { token: csrfToken, timestamp: Date.now() });
+
+  // Set HttpOnly JWT cookie
+  setCookie(c, 'token', jwtToken, {
+    httpOnly: true,
+    secure: isProd(),
+    sameSite: 'Strict',
+    path: '/',
+    maxAge: tokenExpirationDays * 24 * 60 * 60
+  });
+
+  // Set CSRF token cookie (readable by frontend)
+  setCookie(c, 'csrf_token', csrfToken, {
+    httpOnly: false,
+    secure: isProd(),
+    sameSite: 'Lax',
+    path: '/',
+    maxAge: CSRF_TOKEN_EXPIRY / 1000
+  });
+
+  return csrfToken;
+}
+
 // ==== STRIPE WEBHOOK (raw body needed) ====
+
+/**
+ * Resolve a Stripe customer ID to a normalized lowercase email.
+ *
+ * @param {string} stripeID - Stripe customer ID
+ * @returns {Promise<string|null>} Normalized email, or null if missing
+ */
+async function resolveCustomerEmail(stripeID) {
+  const customer = await stripe.customers.retrieve(stripeID);
+  if (!customer?.email) {
+    logger.warn('Webhook: Customer has no email', { stripeID });
+    return null;
+  }
+  return customer.email.toLowerCase();
+}
+
+/**
+ * Build the canonical user.subscription patch from a Stripe customer ID
+ * and a Stripe subscription object.
+ *
+ * @param {string} stripeID - Stripe customer ID
+ * @param {object} stripeSub - Stripe subscription object
+ * @returns {{stripeID: string, expires: number, status: string}}
+ */
+function buildSubscriptionPatch(stripeID, stripeSub) {
+  return {
+    stripeID,
+    expires: stripeSub.current_period_end,
+    status: stripeSub.status
+  };
+}
+
+/**
+ * Apply a $set patch to the user identified by email. Returns false if no
+ * matching user is found (silent no-op so Stripe will not retry).
+ *
+ * @param {string} email - Normalized email
+ * @param {object} $set - MongoDB-style $set fields
+ * @returns {Promise<boolean>} True if a user was patched
+ */
+async function applyUserPatch(email, $set) {
+  const user = await db.findUser({ email });
+  if (!user) {
+    logger.warn('Webhook: No user found for email', { email });
+    return false;
+  }
+  await db.updateUser({ email }, { $set });
+  return true;
+}
+
 app.post("/api/payment", async (c) => {
   logger.info('Payment webhook received');
 
@@ -710,37 +881,72 @@ app.post("/api/payment", async (c) => {
   }
 
   try {
-    // Use the single database config for webhooks
-    const webhookConfig = currentDbConfig;
-    const { customer: stripeID, current_period_end, status } = event.data.object;
-
-    // Validate required fields exist
-    if (!stripeID) {
-      logger.error('Webhook missing customer ID');
-      return c.body(null, 400);
+    // Idempotency check - skip if already processed
+    const existingEvent = await db.findWebhookEvent(event.id);
+    if (existingEvent) {
+      logger.info('Webhook event already processed, skipping', { eventId: event.id });
+      return c.body(null, 200);
     }
 
-    const customer = await stripe.customers.retrieve(stripeID);
+    // Record event BEFORE processing to prevent race conditions
+    await db.insertWebhookEvent(event.id, event.type, Date.now());
 
-    // Null check for customer email
-    if (!customer || !customer.email) {
-      logger.error('Webhook: Customer has no email', { stripeID });
-      return c.body(null, 400);
+    const eventObject = event.data.object;
+
+    if (["customer.subscription.deleted", "customer.subscription.updated", "customer.subscription.created"].includes(event.type)) {
+      const { customer: stripeID, current_period_end, status } = eventObject;
+      if (!stripeID) {
+        logger.error('Webhook missing customer ID', { type: event.type });
+        return c.body(null, 400);
+      }
+      const email = await resolveCustomerEmail(stripeID);
+      if (!email) return c.body(null, 400);
+      const ok = await applyUserPatch(email, { subscription: { stripeID, expires: current_period_end, status } });
+      if (ok) logger.info('Subscription updated', { type: event.type, email, status });
     }
 
-    const customerEmail = customer.email.toLowerCase();
-
-    if (["customer.subscription.deleted", "customer.subscription.updated","customer.subscription.created"].includes(event.type)) {
-      logger.info('Webhook processed', { type: event.type });
-      const user = await databaseManager.findUser(webhookConfig.dbType, webhookConfig.db, webhookConfig.connectionString, { email: customerEmail });
-      if (user) {
-        await databaseManager.updateUser(webhookConfig.dbType, webhookConfig.db, webhookConfig.connectionString, { email: customerEmail }, {
-          $set: { subscription: { stripeID, expires: current_period_end, status } }
-        });
-      } else {
-        logger.warn('Webhook: No user found for email');
+    if (event.type === "checkout.session.completed") {
+      const { customer: stripeID, customer_email, subscription: subscriptionId } = eventObject;
+      if (subscriptionId && stripeID) {
+        const [subscription, email] = await Promise.all([
+          stripe.subscriptions.retrieve(subscriptionId),
+          customer_email ? Promise.resolve(customer_email.toLowerCase()) : resolveCustomerEmail(stripeID)
+        ]);
+        if (email) {
+          const ok = await applyUserPatch(email, { subscription: buildSubscriptionPatch(stripeID, subscription) });
+          if (ok) logger.info('Checkout completed', { email, status: subscription.status });
+        }
       }
     }
+
+    if (event.type === "invoice.paid") {
+      const { customer: stripeID, subscription: subscriptionId } = eventObject;
+      if (subscriptionId && stripeID) {
+        const [subscription, email] = await Promise.all([
+          stripe.subscriptions.retrieve(subscriptionId),
+          resolveCustomerEmail(stripeID)
+        ]);
+        if (email) {
+          const ok = await applyUserPatch(email, { subscription: buildSubscriptionPatch(stripeID, subscription) });
+          if (ok) logger.info('Invoice paid', { email });
+        }
+      }
+    }
+
+    if (event.type === "invoice.payment_failed") {
+      const { customer: stripeID } = eventObject;
+      if (stripeID) {
+        const email = await resolveCustomerEmail(stripeID);
+        if (email) {
+          const ok = await applyUserPatch(email, {
+            'subscription.paymentFailed': true,
+            'subscription.paymentFailedAt': Date.now()
+          });
+          if (ok) logger.warn('Invoice payment failed', { email });
+        }
+      }
+    }
+
     return c.body(null, 200);
   } catch (e) {
     logger.error('Webhook processing error', { error: e.message });
@@ -751,10 +957,34 @@ app.post("/api/payment", async (c) => {
 // ==== STATIC ROUTES ====
 app.get("/api/health", (c) => c.json({ status: "ok", timestamp: Date.now() }));
 
+/**
+ * Parse JSON request body with proper error handling
+ *
+ * Returns parsed JSON or null if parsing fails. Sets 400 response on failure.
+ * Handles SyntaxError from malformed JSON.
+ *
+ * @async
+ * @param {Context} c - Hono context
+ * @returns {Promise<Object|null>} Parsed body or null on error
+ */
+async function parseJsonBody(c) {
+  try {
+    return await c.req.json();
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      return null;
+    }
+    throw e;
+  }
+}
+
 // ==== AUTH ROUTES ====
 app.post("/api/signup", async (c) => {
   try {
-    const body = await c.req.json();
+    const body = await parseJsonBody(c);
+    if (!body) {
+      return c.json({ error: 'Invalid request body' }, 400);
+    }
     let { email, password, name } = body;
 
     // Validation
@@ -775,38 +1005,30 @@ app.post("/api/signup", async (c) => {
     let insertID = generateUUID()
 
     try {
-      const result = await databaseManager.insertUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, {
+      // Insert user first
+      await db.insertUser({
         _id: insertID,
         email: email,
         name: name,
         created_at: Date.now()
       });
 
+      // Insert auth record (compensating delete on failure)
+      try {
+        await db.insertAuth({ email: email, password: hash, userID: insertID });
+      } catch (authError) {
+        // Rollback: delete the user we just created
+        logger.error('Auth insert failed, rolling back user creation', { error: authError.message });
+        try {
+          await db.executeQuery({ query: 'DELETE FROM Users WHERE _id = ?', params: [insertID] });
+        } catch (rollbackError) {
+          logger.error('Rollback failed - orphaned user record', { userID: insertID, error: rollbackError.message });
+        }
+        throw authError;
+      }
+
       const token = await generateToken(insertID);
-      await databaseManager.insertAuth(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { email: email, password: hash, userID: insertID });
-
-      // Generate CSRF token
-      const csrfToken = generateCSRFToken();
-      csrfTokenStore.set(insertID.toString(), { token: csrfToken, timestamp: Date.now() });
-
-      // Set HttpOnly cookie
-      setCookie(c, 'token', token, {
-        httpOnly: true,
-        secure: !isDevelopment,
-        sameSite: 'Strict',
-        path: '/',
-        maxAge: tokenExpirationDays * 24 * 60 * 60
-      });
-
-      // Set CSRF token cookie (readable by frontend)
-      setCookie(c, 'csrf_token', csrfToken, {
-        httpOnly: false,
-        secure: !isDevelopment,
-        sameSite: 'Lax',
-        path: '/',
-        maxAge: CSRF_TOKEN_EXPIRY / 1000
-      });
-
+      setAuthCookies(c, insertID, token);
       logger.info('Signup success');
 
       return c.json({
@@ -830,7 +1052,10 @@ app.post("/api/signup", async (c) => {
 
 app.post("/api/signin", async (c) => {
   try {
-    const body = await c.req.json();
+    const body = await parseJsonBody(c);
+    if (!body) {
+      return c.json({ error: 'Invalid request body' }, 400);
+    }
     let { email, password } = body;
 
     // Validation
@@ -844,16 +1069,28 @@ app.post("/api/signin", async (c) => {
     email = email.toLowerCase().trim();
     logger.debug('Attempting signin');
 
+    // Check account lockout
+    const lockStatus = isAccountLocked(email);
+    if (lockStatus.locked) {
+      c.header('Retry-After', String(lockStatus.remainingTime));
+      return c.json({
+        error: 'Account temporarily locked. Try again later.',
+        retryAfter: lockStatus.remainingTime
+      }, 429);
+    }
+
     // Check if auth exists
-    const auth = await databaseManager.findAuth(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { email: email });
+    const auth = await db.findAuth( { email: email });
     if (!auth) {
       logger.debug('Auth record not found');
+      recordFailedLogin(email);
       return c.json({ error: "Invalid credentials" }, 401);
     }
 
-    //verify
+    // Verify password
     if (!(await verifyPassword(password, auth.password))) {
       logger.debug('Password verification failed');
+      recordFailedLogin(email);
       return c.json({ error: "Invalid credentials" }, 401);
     }
 
@@ -861,48 +1098,26 @@ app.post("/api/signin", async (c) => {
     if (needsRehash(auth.password)) {
       try {
         const newHash = await hashPassword(password);
-        await databaseManager.executeQuery(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, {
-          query: 'UPDATE Auths SET password = ? WHERE email = ?',
-          params: [newHash, email]
-        });
+        await db.updateAuth({ email }, { password: newHash });
         logger.debug('Password hash migrated to scrypt');
       } catch (e) {
         logger.warn('Password rehash failed', { error: e.message });
       }
     }
 
-    // get user
-    const user = await databaseManager.findUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { email: email });
+    // Get user
+    const user = await db.findUser( { email: email });
     if (!user) {
       logger.error('User not found for auth record');
       return c.json({ error: "Invalid credentials" }, 401);
     }
 
-    // generate token
+    // Clear failed attempts on successful login
+    clearFailedLogins(email);
+
+    // Generate token
     const token = await generateToken(user._id.toString());
-
-    // Generate CSRF token
-    const csrfToken = generateCSRFToken();
-    csrfTokenStore.set(user._id.toString(), { token: csrfToken, timestamp: Date.now() });
-
-    // Set HttpOnly cookie
-    setCookie(c, 'token', token, {
-      httpOnly: true,
-      secure: !isDevelopment,
-      sameSite: 'Strict',
-      path: '/',
-      maxAge: tokenExpirationDays * 24 * 60 * 60
-    });
-
-    // Set CSRF token cookie (readable by frontend)
-    setCookie(c, 'csrf_token', csrfToken, {
-      httpOnly: false,
-      secure: !isDevelopment,
-      sameSite: 'Lax',
-      path: '/',
-      maxAge: CSRF_TOKEN_EXPIRY / 1000
-    });
-
+    setAuthCookies(c, user._id, token);
     logger.info('Signin success');
 
     return c.json({
@@ -934,7 +1149,7 @@ app.post("/api/signout", authMiddleware, async (c) => {
     // Clear the HttpOnly cookie
     deleteCookie(c, 'token', {
       httpOnly: true,
-      secure: !isDevelopment,
+      secure: isProd(),
       sameSite: 'Strict',
       path: '/'
     });
@@ -942,7 +1157,7 @@ app.post("/api/signout", authMiddleware, async (c) => {
     // Clear the CSRF token cookie
     deleteCookie(c, 'csrf_token', {
       httpOnly: false,
-      secure: !isDevelopment,
+      secure: isProd(),
       sameSite: 'Lax',
       path: '/'
     });
@@ -955,6 +1170,61 @@ app.post("/api/signout", authMiddleware, async (c) => {
   }
 });
 
+// ==== USER DATA ROUTES ====
+app.get("/api/me", authMiddleware, async (c) => {
+  const userID = c.get('userID');
+  const user = await db.findUser( { _id: userID });
+  logger.debug('/me checking for user');
+  if (!user) return c.json({ error: "User not found" }, 404);
+  return c.json(user);
+});
+
+app.put("/api/me", authMiddleware, csrfProtection, async (c) => {
+  try {
+    const userID = c.get('userID');
+    const body = await c.req.json();
+    const { name } = body;
+
+    // Validation
+    if (name !== undefined && !validateName(name)) {
+      return c.json({ error: 'Name must be 1-100 characters' }, 400);
+    }
+
+    // Whitelist of fields users are allowed to update
+    const UPDATEABLE_USER_FIELDS = ['name'];
+
+    // Find user first to verify existence
+    const user = await db.findUser( { _id: userID });
+    if (!user) return c.json({ error: "User not found" }, 404);
+
+    // Whitelist approach - only allow specific fields
+    const update = {};
+    for (const [key, value] of Object.entries(body)) {
+      if (UPDATEABLE_USER_FIELDS.includes(key)) {
+        // Sanitize string values to prevent XSS
+        update[key] = typeof value === 'string' ? escapeHtml(value.trim()) : value;
+      }
+    }
+
+    if (Object.keys(update).length === 0) {
+      return c.json({ error: "No valid fields to update" }, 400);
+    }
+
+    // Update user document
+    const result = await db.updateUser( { _id: userID }, { $set: update });
+
+    if (result.modifiedCount === 0) {
+      return c.json({ error: "No changes made" }, 400);
+    }
+
+    // Return updated user
+    const updatedUser = await db.findUser( { _id: userID });
+    return c.json(updatedUser);
+  } catch (err) {
+    logger.error('Update user error', { error: err.message });
+    return c.json({ error: "Failed to update user" }, 500);
+  }
+});
 
 // ==== USAGE TRACKING ====
 app.post("/api/usage", authMiddleware, async (c) => {
@@ -968,7 +1238,7 @@ app.post("/api/usage", authMiddleware, async (c) => {
     }
 
     // Get user
-    const user = await databaseManager.findUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { _id: userID });
+    const user = await db.findUser( { _id: userID });
     if (!user) return c.json({ error: "User not found" }, 404);
 
     // Check if user is a subscriber - subscribers get unlimited
@@ -998,7 +1268,7 @@ app.post("/api/usage", authMiddleware, async (c) => {
     if (!usage.reset_at || now > usage.reset_at) {
       const newResetAt = now + (30 * 24 * 60 * 60); // 30 days from now
       // Reset usage - atomic set operation
-      await databaseManager.updateUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString,
+      await db.updateUser(
         { _id: userID },
         { $set: { usage: { count: 0, reset_at: newResetAt } } }
       );
@@ -1008,18 +1278,18 @@ app.post("/api/usage", authMiddleware, async (c) => {
     if (operation === 'track') {
       // Atomic increment first to prevent race conditions
       // Then verify we haven't exceeded the limit
-      await databaseManager.updateUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString,
+      await db.updateUser(
         { _id: userID },
         { $inc: { 'usage.count': 1 } }
       );
 
       // Re-read user to get actual count after atomic increment
-      const updatedUser = await databaseManager.findUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { _id: userID });
+      const updatedUser = await db.findUser( { _id: userID });
       const actualCount = updatedUser?.usage?.count || 1;
 
       // If we exceeded the limit, rollback the increment and return 429
       if (actualCount > limit) {
-        await databaseManager.updateUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString,
+        await db.updateUser(
           { _id: userID },
           { $inc: { 'usage.count': -1 } }
         );
@@ -1062,7 +1332,7 @@ app.post("/api/checkout", authMiddleware, csrfProtection, async (c) => {
     if (!email || !lookup_key) return c.json({ error: "Missing email or lookup_key" }, 400);
 
     // Verify the email matches the authenticated user
-    const user = await databaseManager.findUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { _id: userID });
+    const user = await db.findUser( { _id: userID });
     if (!user || user.email !== email) return c.json({ error: "Email mismatch" }, 403);
 
     const prices = await stripe.prices.list({ lookup_keys: [lookup_key], expand: ["data.product"] });
@@ -1100,7 +1370,7 @@ app.post("/api/portal", authMiddleware, csrfProtection, async (c) => {
     if (!customerID) return c.json({ error: "Missing customerID" }, 400);
 
     // Verify the customerID matches the authenticated user's subscription
-    const user = await databaseManager.findUser(currentDbConfig.dbType, currentDbConfig.db, currentDbConfig.connectionString, { _id: userID });
+    const user = await db.findUser( { _id: userID });
     if (!user || (user.subscription?.stripeID && user.subscription.stripeID !== customerID)) {
       return c.json({ error: "Unauthorized customerID" }, 403);
     }
@@ -1118,383 +1388,17 @@ app.post("/api/portal", authMiddleware, csrfProtection, async (c) => {
   }
 });
 
-// ==== DOMAIN CHECK ROUTE ====
-
-// Rate limiter for /api/check — sliding window, 30 requests per minute per IP
-const CHECK_RATE_LIMIT = 30;
-const CHECK_RATE_WINDOW_MS = 60 * 1000;
-const CHECK_RATE_MAX_ENTRIES = 10000;
-const checkRateStore = new Map(); // IP -> { timestamps: number[] }
-
-/**
- * Rate limit middleware for domain check endpoint
- *
- * Enforces a sliding window of CHECK_RATE_LIMIT requests per CHECK_RATE_WINDOW_MS
- * per IP address. Returns 429 when limit is exceeded. Uses evictOldestEntries
- * for memory management.
- *
- * @async
- * @param {Context} c - Hono context
- * @param {Function} next - Next middleware function
- * @returns {Promise<Response|void>} 429 error or continues to next middleware
- */
-async function checkRateLimit(c, next) {
-  // Prefer x-forwarded-for (reverse proxy), fall back to x-real-ip, then remote address
-  const ip = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
-    || c.req.header('x-real-ip')
-    || c.req.raw?.socket?.remoteAddress
-    || 'unknown';
-  const now = Date.now();
-
-  let entry = checkRateStore.get(ip);
-  if (!entry) {
-    entry = { timestamps: [] };
-    checkRateStore.set(ip, entry);
-  }
-
-  // Remove timestamps outside the window
-  entry.timestamps = entry.timestamps.filter((t) => now - t < CHECK_RATE_WINDOW_MS);
-
-  if (entry.timestamps.length >= CHECK_RATE_LIMIT) {
-    return c.json({ error: 'Rate limit exceeded. Try again shortly.' }, 429);
-  }
-
-  entry.timestamps.push(now);
-
-  // LRU eviction if store is too large
-  evictOldestEntries(checkRateStore, CHECK_RATE_MAX_ENTRIES, (v) => v.timestamps[v.timestamps.length - 1] || 0);
-
-  await next();
-}
-
-// Periodic cleanup of stale rate limit entries every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, entry] of checkRateStore.entries()) {
-    entry.timestamps = entry.timestamps.filter((t) => now - t < CHECK_RATE_WINDOW_MS);
-    if (entry.timestamps.length === 0) {
-      checkRateStore.delete(ip);
-    }
-  }
-}, 5 * 60 * 1000);
-
-/**
- * WHOIS server map keyed by TLD
- *
- * Maps each supported TLD to its authoritative WHOIS server hostname.
- * WHOIS (port 43 TCP) is the most reliable method for checking domain
- * registration status.
- *
- * @type {Object<string, string>}
- */
-const WHOIS_SERVERS = {
-  com: 'whois.verisign-grs.com',
-  net: 'whois.verisign-grs.com',
-  org: 'whois.pir.org',
-  io: 'whois.nic.io',
-  co: 'whois.registry.co',
-  xyz: 'whois.nic.xyz',
-  ai: 'whois.nic.ai',
-  shop: 'whois.nic.shop',
-  site: 'whois.nic.site',
-  tech: 'whois.nic.tech',
-};
-
-/**
- * RDAP endpoint map for TLDs without WHOIS servers
- *
- * Some TLDs (.dev, .app) have no WHOIS server — only RDAP.
- * The correct endpoint is pubapi.registry.google.
- *
- * @type {Object<string, string>}
- */
-const RDAP_SERVERS = {
-  dev: 'https://pubapi.registry.google/rdap/domain/',
-  app: 'https://pubapi.registry.google/rdap/domain/',
-};
-
-const SUPPORTED_TLDS = [...Object.keys(WHOIS_SERVERS), ...Object.keys(RDAP_SERVERS)];
-const WHOIS_TIMEOUT_MS = 5000;
-const RDAP_TIMEOUT_MS = 5000;
-
-/** Patterns in WHOIS response indicating domain is not registered */
-const WHOIS_AVAILABLE_PATTERNS = [
-  'no match', 'not found', 'no data found', 'no entries found',
-  'no object found', 'status: free', 'status: available',
-  'is available', 'domain not found',
-];
-
-/** Patterns in WHOIS response indicating domain is registered */
-const WHOIS_TAKEN_PATTERNS = [
-  'domain name:', 'registrar:', 'creation date:', 'registry domain',
-  'registered on:', 'nserver:', 'name server:',
-];
-
-/**
- * Query WHOIS server via raw TCP socket
- *
- * Opens a TCP connection to the WHOIS server on port 43, sends the domain
- * name, and collects the response. Uses a timeout to avoid hanging on
- * unreachable servers. This is the same protocol the `whois` CLI uses.
- *
- * @async
- * @param {string} server - WHOIS server hostname
- * @param {string} domain - Domain to query
- * @returns {Promise<string>} Raw WHOIS response text
- * @throws {Error} On connection failure, timeout, or socket error
- */
-function queryWhois(server, domain) {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    const socket = net.createConnection(43, server, () => {
-      socket.write(domain + '\r\n');
-    });
-
-    socket.setTimeout(WHOIS_TIMEOUT_MS);
-    socket.setEncoding('utf8');
-
-    socket.on('data', (chunk) => { data += chunk; });
-    socket.on('end', () => resolve(data));
-    socket.on('timeout', () => { socket.destroy(); reject(new Error('WHOIS timeout')); });
-    socket.on('error', (err) => reject(err));
-  });
-}
-
-/**
- * Check domain availability via WHOIS lookup
- *
- * Queries the TLD's authoritative WHOIS server and parses the response
- * for known available/taken patterns. WHOIS is authoritative for registration
- * status — more reliable than DNS which only checks configured records.
- *
- * @async
- * @param {string} tld - Top-level domain
- * @param {string} fqdn - Fully qualified domain name
- * @returns {Promise<{available: boolean|null, status: string, method: string}>}
- */
-async function checkDomainWhois(tld, fqdn) {
-  const server = WHOIS_SERVERS[tld];
-  try {
-    const response = await queryWhois(server, fqdn);
-    const lower = response.toLowerCase();
-
-    // Check taken patterns first — WHOIS boilerplate text often contains
-    // words like "available" in legal disclaimers, causing false positives
-    if (WHOIS_TAKEN_PATTERNS.some((p) => lower.includes(p))) {
-      return { available: false, status: 'taken', method: 'whois' };
-    }
-
-    if (WHOIS_AVAILABLE_PATTERNS.some((p) => lower.includes(p))) {
-      return { available: true, status: 'available', method: 'whois' };
-    }
-
-    return { available: null, status: 'whois-unclear', method: 'whois' };
-  } catch {
-    return null; // Signal to fall back to DNS
-  }
-}
-
-/**
- * DNS error codes that indicate no domain records exist
- * @type {Set<string>}
- */
-const DNS_NOT_FOUND_CODES = new Set(['ENOTFOUND', 'NODATA', 'SERVFAIL', 'REFUSED']);
-
-/**
- * Check domain availability via DNS resolution (fallback)
- *
- * Queries DNS for A, AAAA, and NS records. If any return data, the domain
- * is taken. If none return data and errors indicate nonexistence, it's
- * likely available. Less authoritative than WHOIS — registered domains
- * with no DNS records will appear available.
- *
- * Note: DNS queries go to the system resolver. For additional privacy,
- * configure DNS-over-TLS (DoT) or DNS-over-HTTPS (DoH) at the OS level.
- *
- * @async
- * @param {string} fqdn - Fully qualified domain name
- * @returns {Promise<{available: boolean|null, status: string, method: string}>}
- */
-async function checkDomainDNS(fqdn) {
-  try {
-    const results = await Promise.allSettled([
-      dns.promises.resolve(fqdn, 'A'),
-      dns.promises.resolve(fqdn, 'AAAA'),
-      dns.promises.resolve(fqdn, 'NS'),
-    ]);
-
-    const hasRecords = results.some(
-      (r) => r.status === 'fulfilled' && r.value.length > 0
-    );
-
-    if (hasRecords) {
-      return { available: false, status: 'taken', method: 'dns' };
-    }
-
-    const hasNotFound = results.some(
-      (r) => r.status === 'rejected' && r.reason?.code === 'ENOTFOUND'
-    );
-
-    const allRecognizedErrors = results.every(
-      (r) => r.status === 'rejected' && DNS_NOT_FOUND_CODES.has(r.reason?.code)
-    );
-
-    if (hasNotFound || allRecognizedErrors) {
-      return { available: true, status: 'available', method: 'dns' };
-    }
-
-    return { available: null, status: 'dns-inconclusive', method: 'dns' };
-  } catch {
-    return { available: null, status: 'dns-error', method: 'dns' };
-  }
-}
-
-/**
- * Check domain availability via RDAP lookup
- *
- * Queries the TLD's RDAP endpoint. 200 = taken, 404 = available.
- * Used for TLDs without WHOIS servers (.dev, .app).
- *
- * @async
- * @param {string} tld - Top-level domain
- * @param {string} fqdn - Fully qualified domain name
- * @returns {Promise<{available: boolean|null, status: string, method: string}|null>}
- */
-async function checkDomainRdap(tld, fqdn) {
-  const baseUrl = RDAP_SERVERS[tld];
-  if (!baseUrl) return null;
-
-  try {
-    const res = await fetch(`${baseUrl}${fqdn}`, {
-      signal: AbortSignal.timeout(RDAP_TIMEOUT_MS),
-      headers: {
-        'Accept': 'application/rdap+json',
-        'User-Agent': 'Domain-Checker/1.0'
-      }
-    });
-
-    if (res.status === 404) {
-      return { available: true, status: 'available', method: 'rdap' };
-    }
-    if (res.status === 200) {
-      return { available: false, status: 'taken', method: 'rdap' };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Check single domain via WHOIS, RDAP, or DNS fallback
- *
- * For most TLDs: tries WHOIS first (authoritative). For .dev/.app:
- * tries RDAP (their only lookup protocol). Falls back
- * to DNS resolution if both fail.
- *
- * @async
- * @param {string} tld - Top-level domain
- * @param {string} name - Base domain name
- * @returns {Promise<{tld: string, domain: string, available: boolean|null, status: string, method: string}>}
- */
-async function checkSingleDomain(tld, name) {
-  const fqdn = `${name}.${tld}`;
-
-  // Try RDAP for .dev/.app — they have no WHOIS
-  if (RDAP_SERVERS[tld]) {
-    const rdapResult = await checkDomainRdap(tld, fqdn);
-    if (rdapResult) {
-      return { tld, domain: fqdn, ...rdapResult };
-    }
-  }
-
-  // Try WHOIS for all other TLDs (authoritative)
-  if (WHOIS_SERVERS[tld]) {
-    const whoisResult = await checkDomainWhois(tld, fqdn);
-    if (whoisResult) {
-      return { tld, domain: fqdn, ...whoisResult };
-    }
-  }
-
-  // DNS fallback for unreachable servers
-  const dnsResult = await checkDomainDNS(fqdn);
-  return { tld, domain: fqdn, ...dnsResult };
-}
-
-/**
- * Check domain availability across multiple TLDs via WHOIS + DNS fallback
- *
- * Fans out concurrent WHOIS checks for each TLD. Falls back to DNS for
- * TLDs with unreachable WHOIS servers. Results sorted: available first,
- * then taken, then unknown. Uses POST to keep domain queries out of URLs/logs.
- *
- * @route POST /api/check
- * @param {Object} body - JSON request body
- * @param {string} body.domain - Base domain name (alphanumeric + hyphens only)
- * @returns {Array<{tld: string, domain: string, available: boolean|null, status: string, method: string}>}
- */
-app.post("/api/check", checkRateLimit, async (c) => {
-  let domain;
-  try {
-    const body = await c.req.json();
-    domain = body.domain;
-  } catch {
-    return c.json({ error: 'Invalid JSON body' }, 400);
-  }
-
-  if (!domain) {
-    return c.json({ error: 'Missing domain in request body' }, 400);
-  }
-
-  const name = domain.toLowerCase().trim().replace(/\s+/g, '');
-
-  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(name) || name.length > 63) {
-    return c.json({ error: 'Invalid domain name. Use alphanumeric characters and hyphens only.' }, 400);
-  }
-
-  const results = await Promise.allSettled(
-    SUPPORTED_TLDS.map((tld) => checkSingleDomain(tld, name))
-  );
-
-  const output = results
-    .map((r) => {
-      if (r.status === 'fulfilled') return r.value;
-      return { tld: 'unknown', domain: '', available: null, status: 'error', method: 'none' };
-    })
-    .sort((a, b) => {
-      // Available first, then taken, then unknown
-      const order = (v) => v === true ? 0 : v === false ? 1 : 2;
-      return order(a.available) - order(b.available);
-    });
-
-  c.header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  c.header('Pragma', 'no-cache');
-  return c.json(output);
-});
-
 // ==== STATIC FILE SERVING (Production) ====
-// All /api/* routes are handled above. Everything else is static/SPA.
 const staticDir = resolve(__dirname, config.staticDir);
 
-// Serve static assets - skip /api/* paths
-app.use('*', async (c, next) => {
-  // Skip API routes - they're handled by route handlers above
-  if (c.req.path.startsWith('/api/')) {
-    return next();
-  }
+// Serve static files
+app.use('/*', serveStatic({ root: staticDir }));
 
-  // Try to serve static file
-  const staticMiddleware = serveStatic({ root: staticDir });
-  return staticMiddleware(c, next);
-});
-
-// SPA fallback - serve index.html for client-side routing
+// SPA fallback — only for non-asset routes
 app.get('*', async (c) => {
-  // Skip API routes
-  if (c.req.path.startsWith('/api/')) {
-    return c.json({ error: 'Not found' }, 404);
+  if (c.req.path.startsWith('/api/') || c.req.path.match(/\.\w+$/)) {
+    return c.notFound();
   }
-
   try {
     const indexPath = resolve(staticDir, 'index.html');
     const file = await promisify(readFile)(indexPath);
@@ -1510,15 +1414,15 @@ app.onError((err, c) => {
 
   logger.error('Unhandled error occurred', {
     message: err.message,
-    stack: isDevelopment ? err.stack : undefined,
-    path: redactPath(c.req.path),
+    stack: !isProd() ? err.stack : undefined,
+    path: c.req.path,
     method: c.req.method,
     requestId
   });
 
   return c.json({
-    error: isDevelopment ? err.message : 'Internal server error',
-    ...(isDevelopment && { stack: err.stack })
+    error: !isProd() ? err.message : 'Internal server error',
+    ...(!isProd() && { stack: err.stack })
   }, 500);
 });
 
@@ -1527,27 +1431,22 @@ app.onError((err, c) => {
 /**
  * Check if the server is running in production mode
  *
- * Reads the ENV environment variable. Returns true only when
- * ENV is explicitly set to "production".
+ * Reads the NODE_ENV environment variable. Returns true only when
+ * NODE_ENV is explicitly set to "production".
  *
- * @returns {boolean} True if ENV === "production"
+ * @returns {boolean} True if NODE_ENV === "production"
  */
 function isProd() {
-  if (typeof process.env.ENV === "undefined") {
-    return false
-  } else if (process.env.ENV === "production") {
-    return true
-  } else {
-    return false
-  }
+  return process.env.NODE_ENV === 'production';
 }
 
 /**
- * Load environment variables from local .env file
+ * Load environment variables from .env and optional .env.local file.
  *
- * Reads key=value pairs from backend/.env into process.env. Creates .env
- * from .env.example if it doesn't exist. Handles quoted values, comments,
- * and values containing '=' characters. Only called in non-production mode.
+ * Reads in two passes: backend/.env first (may be symlink to shared creds),
+ * then backend/.env.local for project-specific overrides (wins on conflict).
+ * Creates .env from .env.example if it doesn't exist. Only called in
+ * non-production mode — Railway injects vars directly in prod.
  *
  * @returns {void}
  */
@@ -1555,42 +1454,51 @@ function loadLocalENV() {
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = dirname(__filename);
   const envFilePath = resolve(__dirname, './.env');
+  const envLocalPath = resolve(__dirname, './.env.local');
   const envExamplePath = resolve(__dirname, './.env.example');
 
   // Check if .env exists, if not create it from .env.example
   try {
     statSync(envFilePath);
   } catch (err) {
-    // .env doesn't exist, try to create it from .env.example
     try {
       const exampleData = readFileSync(envExamplePath, 'utf8');
       writeFileSync(envFilePath, exampleData);
     } catch (exampleErr) {
-      console.error('Failed to create .env from template:', exampleErr);
+      logger.error('Failed to create .env from template', { error: exampleErr.message });
       return;
     }
   }
 
+  // Load .env (may be symlink to shared creds)
+  loadEnvFile(envFilePath);
+
+  // Load .env.local overrides (project-specific, optional)
+  loadEnvFile(envLocalPath);
+}
+
+/**
+ * Parse a .env file and apply key=value pairs to process.env.
+ * Skips blank lines and comments. Handles quoted values and values containing '='.
+ * Silently skips if file doesn't exist.
+ * @param {string} filePath - Absolute path to the .env file
+ * @returns {void}
+ */
+function loadEnvFile(filePath) {
   try {
-    const data = readFileSync(envFilePath, 'utf8');
-    const lines = data.split(/\r?\n/);
-    for (let line of lines) {
+    const data = readFileSync(filePath, 'utf8');
+    for (let line of data.split(/\r?\n/)) {
       if (!line || line.trim().startsWith('#')) continue;
-
-      // Split only on first = and handle quoted values
       let [key, ...valueParts] = line.split('=');
-      let value = valueParts.join('='); // Rejoin in case value contains =
-
+      let value = valueParts.join('=');
       if (key && value) {
         key = key.trim();
-        value = value.trim();
-        // Remove surrounding quotes if present
-        value = value.replace(/^["']|["']$/g, '');
+        value = value.trim().replace(/^["']|["']$/g, '');
         process.env[key] = value;
       }
     }
-  } catch (err) {
-    console.error('Failed to load .env file:', err);
+  } catch {
+    // File doesn't exist or unreadable — silent
   }
 }
 
@@ -1602,7 +1510,7 @@ const server = serve({
 }, (info) => {
   logger.info('Server started successfully', {
     port: info.port,
-    environment: isDevelopment ? 'development' : 'production'
+    environment: !isProd() ? 'development' : 'production'
   });
 });
 
