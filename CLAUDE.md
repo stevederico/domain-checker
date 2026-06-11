@@ -20,11 +20,11 @@ npm run install-all    # Install all dependencies (root + workspace)
 
 ### Frontend
 
-- **`src/main.jsx`** — Single route (`home`) using `createSkateboardApp()`
-- **`src/components/HomeView.jsx`** — Domain checker UI. Debounced input (300ms), concurrent API calls, two-column result grid with `DomainRow` component
+- **`src/main.tsx`** — Single route (`home`) using `createSkateboardApp()`
+- **`src/components/HomeView.tsx`** — Domain checker UI. Debounced input (300ms), concurrent API calls, two-column result grid with `DomainRow` component
 - **`src/constants.json`** — App config. `noLogin: true` (no auth required)
 
-### Backend (`backend/server.js`)
+### Backend (`backend/server.ts`)
 
 Hono server on port 8000. The domain check logic is the custom part; the rest is standard skateboard boilerplate (auth, Stripe, CSRF, etc.).
 
@@ -60,7 +60,7 @@ Hono server on port 8000. The domain check logic is the custom part; the rest is
 }
 ```
 
-### UI Indicators (HomeView.jsx → DomainRow component)
+### UI Indicators (HomeView.tsx → DomainRow component)
 
 - **Green dot** (`bg-emerald-500`) — WHOIS/RDAP confirmed available. Click to copy domain.
 - **Yellow dot** (`bg-yellow-500`) — DNS-inferred available. Click to copy with "likely" label.
@@ -122,3 +122,24 @@ Backend requires `backend/.env` with `JWT_SECRET`, `STRIPE_KEY`, `STRIPE_ENDPOIN
 - Set `NODE_ENV=production` in all deployment environments (Dockerfile already does this)
 - Place behind a reverse proxy (nginx, Cloudflare, etc.) that sets `x-forwarded-for` for accurate rate limiting
 - Rate limit: 30 requests/min per IP on the domain check endpoint
+
+## TypeScript Standards
+
+### Style
+
+- TypeScript everywhere — `.ts` / `.tsx` files, `strict` mode always on
+- `@types` packages are dev-only dependencies (`@types/node`, `@types/react`, `@types/react-dom`)
+- No build-step typechecking: `npm run typecheck` runs `tsc --noEmit`; it gates `build` and `test`
+- Always use ES modules — never use `require()`
+
+### TypeScript Anti-Patterns (prohibited)
+
+All of these silence the compiler instead of proving correctness:
+
+- Never use `any` — use `unknown` and narrow with type guards
+- Never use `as` casts to silence errors (especially `as unknown as X`) — prove the type instead
+- Never use `!` non-null assertions — handle the null/undefined case
+- Never use `@ts-ignore` — if truly unavoidable, use `@ts-expect-error` with a reason comment (it fails when the error goes away)
+- Never disable or loosen `strict` in tsconfig
+- Never use loose built-in types (`Function`, `object`, `{}`) — write precise signatures and shapes
+- Never cast unvalidated data at boundaries — no `JSON.parse(x) as User` without a runtime check
