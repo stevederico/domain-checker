@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
+import type { ChangeEvent } from 'react';
 import { toast } from 'sonner';
 import { Input } from '@stevederico/skateboard-ui/shadcn/ui/input';
 import { Spinner } from '@stevederico/skateboard-ui/shadcn/ui/spinner';
@@ -6,11 +7,25 @@ import { Kbd } from '@stevederico/skateboard-ui/shadcn/ui/kbd';
 
 const TLDS = ['com', 'net', 'org', 'io', 'dev', 'app', 'co', 'xyz', 'ai', 'shop', 'site', 'tech'];
 
+/** Single TLD availability result returned by the /check endpoint (or built locally). */
+interface DomainResult {
+  /** Top-level domain (e.g. "com"). */
+  tld: string;
+  /** Full domain name (e.g. "example.com"). */
+  domain: string;
+  /** Availability — null while loading or on error/unknown. */
+  available: boolean | null;
+  /** Status string ("loading", "error", or a backend-provided state). */
+  status: string;
+  /** Check method that produced the result ("whois", "rdap", or "dns"). */
+  method?: string;
+}
+
 /**
  * Determine backend URL based on environment
- * @returns {string} Base API URL
+ * @returns Base API URL
  */
-function getApiBase() {
+function getApiBase(): string {
   if (typeof window !== 'undefined' && window.location.port === '5173') {
     return 'http://localhost:8000/api';
   }
@@ -25,21 +40,21 @@ function getApiBase() {
  * Available domains copy to clipboard on click (no external registrar links).
  *
  * @component
- * @returns {JSX.Element} Domain checker view
+ * @returns Domain checker view
  */
 export default function HomeView() {
   const [query, setQuery] = useState('');
-  const [results, setResults] = useState([]);
+  const [results, setResults] = useState<DomainResult[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
-  const inputRef = useRef(null);
-  const debounceRef = useRef(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
 
-  const checkDomain = useCallback(async (name) => {
+  const checkDomain = useCallback(async (name: string) => {
     if (!name || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i.test(name)) {
       setResults([]);
       setHasSearched(false);
@@ -63,7 +78,7 @@ export default function HomeView() {
         body: JSON.stringify({ domain: name }),
         cache: 'no-store'
       });
-      const data = await res.json();
+      const data: DomainResult[] = await res.json();
       setResults(data);
     } catch (err) {
       console.error('Domain check failed');
@@ -78,7 +93,7 @@ export default function HomeView() {
     }
   }, []);
 
-  const handleInputChange = useCallback((e) => {
+  const handleInputChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
     const raw = e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '');
     setQuery(raw);
 
@@ -172,14 +187,20 @@ export default function HomeView() {
 /**
  * Copy domain name to clipboard and show toast notification
  *
- * @param {string} domain - Domain name to copy
+ * @param domain - Domain name to copy
  */
-function copyDomain(domain) {
+function copyDomain(domain: string) {
   navigator.clipboard.writeText(domain).then(() => {
     toast.success(`Copied ${domain}`);
   }).catch(() => {
     toast.error('Failed to copy');
   });
+}
+
+/** Props for {@link DomainRow}. */
+interface DomainRowProps {
+  /** Domain check result to render. */
+  result: DomainResult;
 }
 
 /**
@@ -190,16 +211,9 @@ function copyDomain(domain) {
  * Red dot = taken (muted text). Gray dot = unknown/loading.
  *
  * @component
- * @param {Object} props
- * @param {Object} props.result - Domain check result
- * @param {string} props.result.tld - Top-level domain
- * @param {string} props.result.domain - Full domain name
- * @param {boolean|null} props.result.available - Availability (null = unknown)
- * @param {string} props.result.status - Status string
- * @param {string} [props.result.method] - Check method ("whois", "rdap", or "dns")
- * @returns {JSX.Element} Domain result row
+ * @returns Domain result row
  */
-function DomainRow({ result }) {
+function DomainRow({ result }: DomainRowProps) {
   const { domain, available, status, method } = result;
   const isLoading = status === 'loading';
   const isDNS = method === 'dns';
