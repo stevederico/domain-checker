@@ -8,11 +8,12 @@
  */
 import './assets/styles.css';
 import { createSkateboardApp } from '@stevederico/skateboard-ui/App';
+import type { AppRoute } from '@stevederico/skateboard-ui/App';
 import { Navigate } from 'react-router';
 import Layout from '@stevederico/skateboard-ui/Layout';
 import constants from './constants.json';
-import HomeView from './components/HomeView.jsx';
-import CommandMenu from './components/CommandMenu.jsx';
+import HomeView from './components/HomeView';
+import CommandMenu from './components/CommandMenu';
 
 
 /**
@@ -21,7 +22,7 @@ import CommandMenu from './components/CommandMenu.jsx';
  * Wraps the default skateboard-ui Layout and injects CommandMenu
  * so the Cmd+K shortcut is available on all authenticated routes.
  *
- * @returns {JSX.Element} Layout with command menu
+ * @returns Layout with command menu
  */
 function AppLayout() {
   return (
@@ -34,19 +35,20 @@ function AppLayout() {
 
 /**
  * Application route configuration
- * @type {Array<{path: string, element: JSX.Element}>}
+ *
+ * Maps route paths to view components. Routes are relative to root (no leading slash).
  */
-const appRoutes = [
+const appRoutes: AppRoute[] = [
   { path: 'home', element: <HomeView /> },
 ];
 
 /**
  * Initialize and mount Skateboard app
  *
- * @param {Object} config - App configuration
- * @param {Object} config.constants - App constants from constants.json
- * @param {Array} config.appRoutes - Route configuration array
- * @param {string} config.defaultRoute - Initial route path
+ * @param config - App configuration
+ * @param config.constants - App constants from constants.json
+ * @param config.appRoutes - Route configuration array
+ * @param config.defaultRoute - Initial route path
  */
 createSkateboardApp({
   constants,
