@@ -3,6 +3,7 @@ import { Hono } from 'hono'
 import type { Context, Next } from 'hono'
 import { serve } from '@hono/node-server'
 import { serveStatic } from '@hono/node-server/serve-static'
+import { getConnInfo } from '@hono/node-server/conninfo'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { secureHeaders } from 'hono/secure-headers'
 import { cors } from 'hono/cors'
@@ -14,6 +15,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFile, mkdir, stat } from 'node:fs';
 import { promisify } from 'node:util';
+import dns from 'node:dns';
+import net from 'node:net';
 import type { BackendConfig, BoundDatabase, CsrfTokenEntry, DatabaseConfig, JwtPayload, Logger, Subscription, UserSetFields } from './types.ts';
 import { createLogger } from './lib/logger.ts';
 import { isProd, loadEnvFile, loadLocalENV, resolveEnvironmentVariables, validateEnvironmentVariables } from './lib/env.ts';
@@ -1474,6 +1477,361 @@ app.post("/api/portal", authMiddleware, csrfProtection, async (c) => {
     logger.error('Portal session error', { error: errorMessage(e) });
     return c.json({ error: "Stripe portal failed" }, 500);
   }
+});
+
+// ==== DOMAIN CHECK ROUTE ====
+
+/** Lookup protocol that produced a domain-availability result. */
+type CheckMethod = 'whois' | 'rdap' | 'dns' | 'none';
+
+/** Availability result for a single TLD lookup. */
+interface DomainCheckResult {
+  tld: string;
+  domain: string;
+  available: boolean | null;
+  status: string;
+  method: CheckMethod;
+}
+
+/** Availability outcome without the tld/domain identity fields. */
+type CheckOutcome = Pick<DomainCheckResult, 'available' | 'status' | 'method'>;
+
+// Rate limiter for /api/check — sliding window, 30 requests per minute per IP
+const CHECK_RATE_LIMIT = 30;
+const CHECK_RATE_WINDOW_MS = 60 * 1000;
+const CHECK_RATE_MAX_ENTRIES = 10000;
+const checkRateStore = new Map<string, { timestamps: number[] }>();
+
+/**
+ * Rate limit middleware for the domain check endpoint
+ *
+ * Enforces a sliding window of CHECK_RATE_LIMIT requests per
+ * CHECK_RATE_WINDOW_MS per client IP, returning 429 when exceeded. Prefers
+ * x-forwarded-for (reverse proxy), then x-real-ip, then the socket remote
+ * address. Uses evictOldestEntries for bounded memory.
+ *
+ * @param c - Hono context
+ * @param next - Next middleware in the chain
+ * @returns 429 JSON response when over the limit, otherwise continues
+ */
+async function checkRateLimit(c: Context<AppEnv>, next: Next) {
+  const ip = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
+    || c.req.header('x-real-ip')
+    || getConnInfo(c).remote.address
+    || 'unknown';
+  const now = Date.now();
+
+  let entry = checkRateStore.get(ip);
+  if (!entry) {
+    entry = { timestamps: [] };
+    checkRateStore.set(ip, entry);
+  }
+
+  // Drop timestamps outside the sliding window
+  entry.timestamps = entry.timestamps.filter((t) => now - t < CHECK_RATE_WINDOW_MS);
+
+  if (entry.timestamps.length >= CHECK_RATE_LIMIT) {
+    return c.json({ error: 'Rate limit exceeded. Try again shortly.' }, 429);
+  }
+
+  entry.timestamps.push(now);
+  evictOldestEntries(checkRateStore, CHECK_RATE_MAX_ENTRIES, (v) => v.timestamps[v.timestamps.length - 1] || 0);
+
+  await next();
+}
+
+// Periodic cleanup of stale rate limit entries every 5 minutes
+unrefTimer(setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of checkRateStore.entries()) {
+    entry.timestamps = entry.timestamps.filter((t) => now - t < CHECK_RATE_WINDOW_MS);
+    if (entry.timestamps.length === 0) {
+      checkRateStore.delete(ip);
+    }
+  }
+}, 5 * 60 * 1000));
+
+/**
+ * WHOIS server map keyed by TLD
+ *
+ * Maps each supported TLD to its authoritative WHOIS server hostname. WHOIS
+ * (port 43 TCP) is the most reliable check for domain registration status.
+ */
+const WHOIS_SERVERS: Record<string, string> = {
+  com: 'whois.verisign-grs.com',
+  net: 'whois.verisign-grs.com',
+  org: 'whois.pir.org',
+  io: 'whois.nic.io',
+  co: 'whois.registry.co',
+  xyz: 'whois.nic.xyz',
+  ai: 'whois.nic.ai',
+  shop: 'whois.nic.shop',
+  site: 'whois.nic.site',
+  tech: 'whois.nic.tech',
+};
+
+/**
+ * RDAP endpoint map for TLDs without WHOIS servers
+ *
+ * Some TLDs (.dev, .app) have no WHOIS server — only RDAP. The correct
+ * endpoint is pubapi.registry.google.
+ */
+const RDAP_SERVERS: Record<string, string> = {
+  dev: 'https://pubapi.registry.google/rdap/domain/',
+  app: 'https://pubapi.registry.google/rdap/domain/',
+};
+
+const SUPPORTED_TLDS = [...Object.keys(WHOIS_SERVERS), ...Object.keys(RDAP_SERVERS)];
+const WHOIS_TIMEOUT_MS = 5000;
+const RDAP_TIMEOUT_MS = 5000;
+
+/** Patterns in a WHOIS response indicating the domain is not registered */
+const WHOIS_AVAILABLE_PATTERNS = [
+  'no match', 'not found', 'no data found', 'no entries found',
+  'no object found', 'status: free', 'status: available',
+  'is available', 'domain not found',
+];
+
+/** Patterns in a WHOIS response indicating the domain is registered */
+const WHOIS_TAKEN_PATTERNS = [
+  'domain name:', 'registrar:', 'creation date:', 'registry domain',
+  'registered on:', 'nserver:', 'name server:',
+];
+
+/**
+ * Query a WHOIS server via raw TCP socket
+ *
+ * Opens a TCP connection to the WHOIS server on port 43, sends the domain
+ * name, and collects the response. Uses a timeout to avoid hanging on
+ * unreachable servers — the same protocol the `whois` CLI uses.
+ *
+ * @param server - WHOIS server hostname
+ * @param domain - Domain to query
+ * @returns Raw WHOIS response text
+ * @throws Error on connection failure, timeout, or socket error
+ */
+function queryWhois(server: string, domain: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    const socket = net.createConnection(43, server, () => {
+      socket.write(domain + '\r\n');
+    });
+
+    socket.setTimeout(WHOIS_TIMEOUT_MS);
+    socket.setEncoding('utf8');
+
+    socket.on('data', (chunk) => { data += chunk; });
+    socket.on('end', () => resolve(data));
+    socket.on('timeout', () => { socket.destroy(); reject(new Error('WHOIS timeout')); });
+    socket.on('error', (err) => reject(err));
+  });
+}
+
+/**
+ * Check domain availability via WHOIS lookup
+ *
+ * Queries the TLD's authoritative WHOIS server and parses the response for
+ * known available/taken patterns. Taken patterns are checked first because
+ * WHOIS boilerplate often contains the word "available" in legal disclaimers.
+ *
+ * @param tld - Top-level domain
+ * @param fqdn - Fully qualified domain name
+ * @returns Availability outcome, or null to signal a DNS fallback
+ */
+async function checkDomainWhois(tld: string, fqdn: string): Promise<CheckOutcome | null> {
+  const server = WHOIS_SERVERS[tld];
+  try {
+    const response = await queryWhois(server, fqdn);
+    const lower = response.toLowerCase();
+
+    if (WHOIS_TAKEN_PATTERNS.some((p) => lower.includes(p))) {
+      return { available: false, status: 'taken', method: 'whois' };
+    }
+
+    if (WHOIS_AVAILABLE_PATTERNS.some((p) => lower.includes(p))) {
+      return { available: true, status: 'available', method: 'whois' };
+    }
+
+    return { available: null, status: 'whois-unclear', method: 'whois' };
+  } catch {
+    return null; // Signal to fall back to DNS
+  }
+}
+
+/** DNS error codes that indicate no domain records exist */
+const DNS_NOT_FOUND_CODES = new Set(['ENOTFOUND', 'NODATA', 'SERVFAIL', 'REFUSED']);
+
+/**
+ * Extract a Node.js error `code` from an unknown rejection reason
+ *
+ * @param reason - Rejection reason of unknown shape
+ * @returns The string error code, or undefined if absent
+ */
+function nodeErrorCode(reason: unknown): string | undefined {
+  if (reason && typeof reason === 'object' && 'code' in reason) {
+    const { code } = reason;
+    return typeof code === 'string' ? code : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Check domain availability via DNS resolution (fallback)
+ *
+ * Queries DNS for A, AAAA, and NS records. Any returned data means the domain
+ * is taken. If all lookups fail with nonexistence errors, it is likely
+ * available. Less authoritative than WHOIS — a registered domain with no DNS
+ * records appears available.
+ *
+ * @param fqdn - Fully qualified domain name
+ * @returns Availability outcome via DNS
+ */
+async function checkDomainDNS(fqdn: string): Promise<CheckOutcome> {
+  try {
+    const results = await Promise.allSettled([
+      dns.promises.resolve(fqdn, 'A'),
+      dns.promises.resolve(fqdn, 'AAAA'),
+      dns.promises.resolve(fqdn, 'NS'),
+    ]);
+
+    const hasRecords = results.some(
+      (r) => r.status === 'fulfilled' && r.value.length > 0
+    );
+
+    if (hasRecords) {
+      return { available: false, status: 'taken', method: 'dns' };
+    }
+
+    const hasNotFound = results.some(
+      (r) => r.status === 'rejected' && nodeErrorCode(r.reason) === 'ENOTFOUND'
+    );
+
+    const allRecognizedErrors = results.every(
+      (r) => r.status === 'rejected' && DNS_NOT_FOUND_CODES.has(nodeErrorCode(r.reason) ?? '')
+    );
+
+    if (hasNotFound || allRecognizedErrors) {
+      return { available: true, status: 'available', method: 'dns' };
+    }
+
+    return { available: null, status: 'dns-inconclusive', method: 'dns' };
+  } catch {
+    return { available: null, status: 'dns-error', method: 'dns' };
+  }
+}
+
+/**
+ * Check domain availability via RDAP lookup
+ *
+ * Queries the TLD's RDAP endpoint. 200 = taken, 404 = available. Used for
+ * TLDs without a WHOIS server (.dev, .app).
+ *
+ * @param tld - Top-level domain
+ * @param fqdn - Fully qualified domain name
+ * @returns Availability outcome, or null when inconclusive/unsupported
+ */
+async function checkDomainRdap(tld: string, fqdn: string): Promise<CheckOutcome | null> {
+  const baseUrl = RDAP_SERVERS[tld];
+  if (!baseUrl) return null;
+
+  try {
+    const res = await fetch(`${baseUrl}${fqdn}`, {
+      signal: AbortSignal.timeout(RDAP_TIMEOUT_MS),
+      headers: {
+        'Accept': 'application/rdap+json',
+        'User-Agent': 'Domain-Checker/1.0'
+      }
+    });
+
+    if (res.status === 404) {
+      return { available: true, status: 'available', method: 'rdap' };
+    }
+    if (res.status === 200) {
+      return { available: false, status: 'taken', method: 'rdap' };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check a single domain via RDAP, WHOIS, or DNS fallback
+ *
+ * For .dev/.app: tries RDAP (their only lookup protocol). For all other TLDs:
+ * tries WHOIS first (authoritative). Falls back to DNS resolution if both fail.
+ *
+ * @param tld - Top-level domain
+ * @param name - Base domain name
+ * @returns Availability result for `${name}.${tld}`
+ */
+async function checkSingleDomain(tld: string, name: string): Promise<DomainCheckResult> {
+  const fqdn = `${name}.${tld}`;
+
+  // Try RDAP for .dev/.app — they have no WHOIS
+  if (RDAP_SERVERS[tld]) {
+    const rdapResult = await checkDomainRdap(tld, fqdn);
+    if (rdapResult) {
+      return { tld, domain: fqdn, ...rdapResult };
+    }
+  }
+
+  // Try WHOIS for all other TLDs (authoritative)
+  if (WHOIS_SERVERS[tld]) {
+    const whoisResult = await checkDomainWhois(tld, fqdn);
+    if (whoisResult) {
+      return { tld, domain: fqdn, ...whoisResult };
+    }
+  }
+
+  // DNS fallback for unreachable servers
+  const dnsResult = await checkDomainDNS(fqdn);
+  return { tld, domain: fqdn, ...dnsResult };
+}
+
+/**
+ * Check domain availability across all supported TLDs
+ *
+ * Fans out concurrent RDAP/WHOIS/DNS checks per TLD. Results are sorted
+ * available-first, then taken, then unknown. POST keeps domain queries out of
+ * URLs/logs. Responses are marked no-store so results are never cached.
+ *
+ * @route POST /api/check
+ */
+app.post("/api/check", checkRateLimit, async (c) => {
+  const body = await parseJsonBody<{ domain?: unknown }>(c);
+  if (!body) {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const rawDomain = body.domain;
+  if (typeof rawDomain !== 'string' || !rawDomain) {
+    return c.json({ error: 'Missing domain in request body' }, 400);
+  }
+
+  const name = rawDomain.toLowerCase().trim().replace(/\s+/g, '');
+
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(name) || name.length > 63) {
+    return c.json({ error: 'Invalid domain name. Use alphanumeric characters and hyphens only.' }, 400);
+  }
+
+  const results = await Promise.allSettled(
+    SUPPORTED_TLDS.map((tld) => checkSingleDomain(tld, name))
+  );
+
+  const output: DomainCheckResult[] = results
+    .map((r): DomainCheckResult => r.status === 'fulfilled'
+      ? r.value
+      : { tld: 'unknown', domain: '', available: null, status: 'error', method: 'none' })
+    .sort((a, b) => {
+      // Available first, then taken, then unknown
+      const order = (v: boolean | null): number => v === true ? 0 : v === false ? 1 : 2;
+      return order(a.available) - order(b.available);
+    });
+
+  c.header('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  c.header('Pragma', 'no-cache');
+  return c.json(output);
 });
 
 // ==== STATIC FILE SERVING (Production) ====
