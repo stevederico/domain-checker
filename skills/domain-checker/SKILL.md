@@ -1,64 +1,33 @@
 ---
 name: domain-checker
-description: Check domain name availability across 12 TLDs (.com, .net, .org, .io, .dev, .app, .co, .xyz, .ai, .shop, .site, .tech). Use when the user asks about domain availability, wants to find a domain name, or mentions registering a domain.
+author: stevederico
+skills-sh: later
+description: >
+  Check domain name availability across 12 TLDs (.com, .net, .org, .io, .dev, .app, .co, .xyz, .ai, .shop, .site, .tech).
+  Prefer the Domain Checker API; fall back to local WHOIS/RDAP via scripts/check.sh. Use when the user asks about domain
+  availability, wants to find a domain name, or mentions registering a domain.
+allowed-tools: Bash(curl:*), Bash(whois:*), Bash(*domain-checker/scripts/check.sh*)
 metadata:
-  author: stevederico
-  version: "1.0"
+  version: "1.2"
 ---
 
 # Domain Checker
 
-Check domain availability across 12 TLDs via the Domain Checker API.
+Check domain availability across 12 TLDs. **One skill, two backends.**
+
+| Backend | When |
+|---|---|
+| **API** (default) | Online: `POST https://checker.bixbyapps.com/api/check` |
+| **Local WHOIS/RDAP** | API fails, offline, or user wants no external service |
 
 ## When to use
 
-- User asks "is example.com available?"
-- User wants to find available domain names
-- User is brainstorming project names and wants to check domains
-- User mentions registering, buying, or checking a domain
+- “Is example.com available?”
+- Brainstorming names / registering a domain
 
-## API
+## Method 1 — API (preferred)
 
-**Endpoint:** `POST https://checker.bixbyapps.com/api/check`
-
-**Request:**
-```json
-{
-  "domain": "example"
-}
-```
-
-The `domain` field is the base name only (no TLD). Alphanumeric and hyphens only, max 63 characters.
-
-**Response:** Array of results sorted by availability (available first):
-```json
-[
-  {
-    "tld": "dev",
-    "domain": "example.dev",
-    "available": true,
-    "status": "available",
-    "method": "rdap"
-  },
-  {
-    "tld": "com",
-    "domain": "example.com",
-    "available": false,
-    "status": "taken",
-    "method": "whois"
-  }
-]
-```
-
-**Fields:**
-- `available`: `true` (available), `false` (taken), `null` (unknown)
-- `status`: `available`, `taken`, `likely-available`, `whois-unclear`, `error`
-- `method`: `whois`, `rdap`, `dns`
-
-## How to check a domain
-
-1. Strip the TLD if the user provides one (e.g., "example.com" -> "example")
-2. Call the API:
+Strip TLD if provided (`example.com` → `example`), then:
 
 ```bash
 curl -s -X POST https://checker.bixbyapps.com/api/check \
@@ -67,22 +36,44 @@ curl -s -X POST https://checker.bixbyapps.com/api/check \
   -d '{"domain": "example"}'
 ```
 
-3. Present results as a table:
+Response is an array sorted available-first (`available` true/false/null, `status`, `method`).
+
+Present as a table:
 
 | Domain | Status |
 |--------|--------|
 | example.dev | Available |
-| example.app | Available |
 | example.com | Taken |
 
-Use green/available and red/taken language. Group available domains first.
+## Method 2 — Local script (fallback)
 
-## Checking multiple names
+Requires `whois` + `curl` (macOS has whois). From this skill directory:
 
-If the user wants to check several names, call the API once per name. Run calls in parallel when possible.
+```bash
+# path when installed under agents skills:
+~/.agents/skills/domain-checker/scripts/check.sh example
+```
+
+Or relative if cwd is the skill folder: `scripts/check.sh example`
+
+Output: pipe-delimited, available first:
+
+```
+example.dev|Available
+example.com|Taken
+```
+
+- 10 TLDs via `whois -h <server>`
+- `.dev` / `.app` via RDAP
+- Parallel lookups
+
+## Multiple names
+
+One call/script per base name; run in parallel when possible.
 
 ## Edge cases
 
 - Rate limited: wait and retry once
-- `available: null` means the lookup was inconclusive — report as "Unknown"
-- `likely-available` means DNS found no records but WHOIS was inconclusive — report as "Likely Available"
+- `available: null` / `Unknown` → inconclusive
+- `likely-available` → no DNS, WHOIS unclear — say “Likely Available”
+- API down → use local script automatically

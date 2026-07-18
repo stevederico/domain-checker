@@ -1,5 +1,11 @@
 ## CHANGELOG
 
+0.5.0
+
+  Refresh domain-checker skill
+  API plus local WHOIS
+  Lock allowed-tools
+
 0.4.0
 
   Bump skateboard 3.4.0
