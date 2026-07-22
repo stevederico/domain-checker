@@ -126,5 +126,5 @@ MIT License — see [LICENSE](LICENSE) for details.
 ---
 
 <div align="center">
-  Made with <a href="https://github.com/stevederico/skateboard">Skateboard</a> — a React boilerplate with auth and payments
+  Made with <a href="https://github.com/stevederico/skateboard">Skateboard</a> — a React boilerplate
 </div>
