@@ -1,5 +1,16 @@
 ## CHANGELOG
 
+5.4.0
+
+  Migrate skateboard 5.4.0
+  Replace Hono Rust backend
+  Pin skateboard-ui 5.1.0
+  Port check endpoint
+  Rewrite icons lucide-react
+  Split legal json
+  Move theme bootstrap public
+  Drop vitest swc
+
 0.5.0
 
   Refresh domain-checker skill
