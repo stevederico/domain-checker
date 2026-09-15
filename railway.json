@@ -1,5 +1,5 @@
 {
   "deploy": {
-    "sleepApplication": false
+    "sleepApplication": true
   }
 }
