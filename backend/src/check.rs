@@ -3,11 +3,11 @@
 //! Port of the Hono handler in `backend/server.ts`: WHOIS on port 43, RDAP
 //! over HTTPS for `.dev`/`.app`, DNS fallback. Bounded per-IP sliding window
 //! (30 / 60s). Zero crates: `TcpStream` for WHOIS, system `curl` for RDAP
-//! (already in the runtime image), `ToSocketAddrs` for DNS.
+//! (already in the runtime image), UDP DNS to the system resolver for A/AAAA/NS.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::Command;
 use std::sync::Mutex;
 use std::thread;
@@ -23,6 +23,12 @@ const CHECK_RATE_WINDOW_MS: i64 = 60 * 1000;
 const CHECK_RATE_MAX_ENTRIES: usize = 10_000;
 
 const WHOIS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-query budget for the DNS fallback. Three record types run in parallel.
+const DNS_TIMEOUT: Duration = Duration::from_secs(2);
+const DNS_QTYPE_A: u16 = 1;
+const DNS_QTYPE_NS: u16 = 2;
+const DNS_QTYPE_AAAA: u16 = 28;
+const DNS_CLASS_IN: u16 = 1;
 
 /// WHOIS host per TLD. `.dev`/`.app` have none (RDAP only).
 const WHOIS_SERVERS: &[(&str, &str)] = &[
@@ -308,25 +314,225 @@ fn check_rdap(base: &str, fqdn: &str) -> Option<Outcome> {
     }
 }
 
-fn check_dns(fqdn: &str) -> Outcome {
-    let taken = (fqdn, 80u16)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| addrs.next())
-        .is_some();
-    if taken {
-        Outcome {
+/// One DNS answer class. Maps the Node `dns.promises.resolve` outcomes the
+/// Hono fallback treated as records, nonexistence, or inconclusive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DnsKind {
+    Found,
+    NxDomain,
+    NoData,
+    ServFail,
+    Refused,
+    Other,
+}
+
+/// Collapse A, AAAA, and NS outcomes the way the Hono handler behaved.
+///
+/// Any answer section means taken, including NS-only names. `NXDOMAIN`
+/// (`ENOTFOUND`) means likely available. Empty answers are `ENODATA` in Node,
+/// and the old set listed `NODATA`, so those stayed inconclusive rather than
+/// free. A dead resolver stays inconclusive for the same reason.
+fn dns_outcome(kinds: [DnsKind; 3]) -> Outcome {
+    if kinds.iter().any(|kind| *kind == DnsKind::Found) {
+        return Outcome {
             available: Some(false),
             status: "taken",
             method: "dns",
-        }
-    } else {
-        Outcome {
+        };
+    }
+    if kinds.iter().any(|kind| *kind == DnsKind::NxDomain) {
+        return Outcome {
             available: Some(true),
             status: "available",
             method: "dns",
+        };
+    }
+    Outcome {
+        available: None,
+        status: "dns-inconclusive",
+        method: "dns",
+    }
+}
+
+fn dns_error() -> Outcome {
+    Outcome {
+        available: None,
+        status: "dns-error",
+        method: "dns",
+    }
+}
+
+fn classify_reply(rcode: u8, ancount: u16) -> DnsKind {
+    match rcode {
+        0 if ancount > 0 => DnsKind::Found,
+        0 => DnsKind::NoData,
+        2 => DnsKind::ServFail,
+        3 => DnsKind::NxDomain,
+        5 => DnsKind::Refused,
+        _ => DnsKind::Other,
+    }
+}
+
+/// First `nameserver` in a resolv.conf body.
+fn first_nameserver(text: &str) -> Option<&str> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("nameserver") {
+            continue;
+        }
+        let ip = parts.next()?;
+        if !ip.is_empty() {
+            return Some(ip);
         }
     }
+    None
+}
+
+fn system_nameserver() -> Option<String> {
+    let text = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    first_nameserver(&text).map(str::to_string)
+}
+
+fn parse_nameserver(ns: &str) -> Option<SocketAddr> {
+    let host = ns.trim();
+    if host.is_empty() {
+        return None;
+    }
+    if host.contains(':') {
+        let bracketed = if host.starts_with('[') {
+            host.to_string()
+        } else {
+            format!("[{host}]")
+        };
+        return format!("{bracketed}:53").parse().ok();
+    }
+    format!("{host}:53").parse().ok()
+}
+
+fn encode_qname(fqdn: &str, out: &mut Vec<u8>) -> bool {
+    if fqdn.is_empty() || fqdn.len() > 253 {
+        return false;
+    }
+    for label in fqdn.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        // Length is at most 63, which fits in the DNS label-length byte.
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+    true
+}
+
+fn build_query(id: u16, fqdn: &str, qtype: u16) -> Option<Vec<u8>> {
+    let mut query = Vec::with_capacity(64);
+    query.extend_from_slice(&id.to_be_bytes());
+    query.extend_from_slice(&0x0100u16.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    query.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    if !encode_qname(fqdn, &mut query) {
+        return None;
+    }
+    query.extend_from_slice(&qtype.to_be_bytes());
+    query.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+    Some(query)
+}
+
+struct DnsHeader {
+    rcode: u8,
+    ancount: u16,
+    truncated: bool,
+}
+
+fn parse_dns_header(buf: &[u8], expect_id: u16) -> Option<DnsHeader> {
+    if buf.len() < 12 {
+        return None;
+    }
+    let id = u16::from_be_bytes([buf[0], buf[1]]);
+    if id != expect_id {
+        return None;
+    }
+    let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    if flags & 0x8000 == 0 {
+        return None;
+    }
+    Some(DnsHeader {
+        rcode: (flags & 0x000F) as u8,
+        ancount: u16::from_be_bytes([buf[6], buf[7]]),
+        truncated: flags & 0x0200 != 0,
+    })
+}
+
+fn query_id(fqdn: &str, qtype: u16) -> u16 {
+    let mut hash: u16 = 0x9E37;
+    for byte in fqdn.bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(u16::from(byte));
+    }
+    hash ^ qtype ^ (crate::config::now_ms() as u16)
+}
+
+fn bind_dns_socket(addr: SocketAddr) -> Option<UdpSocket> {
+    let local = if addr.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0u16; 8], 0))
+    };
+    let sock = UdpSocket::bind(local).ok()?;
+    sock.set_read_timeout(Some(DNS_TIMEOUT)).ok()?;
+    sock.connect(addr).ok()?;
+    Some(sock)
+}
+
+fn query_record(addr: SocketAddr, fqdn: &str, qtype: u16) -> DnsKind {
+    let id = query_id(fqdn, qtype);
+    let packet = match build_query(id, fqdn, qtype) {
+        Some(packet) => packet,
+        None => return DnsKind::Other,
+    };
+    let sock = match bind_dns_socket(addr) {
+        Some(sock) => sock,
+        None => return DnsKind::Other,
+    };
+    if sock.send(&packet).is_err() {
+        return DnsKind::Other;
+    }
+    let mut buf = [0u8; 512];
+    let size = match sock.recv(&mut buf) {
+        Ok(size) => size,
+        Err(_) => return DnsKind::Other,
+    };
+    match parse_dns_header(&buf[..size], id) {
+        Some(header) if header.truncated => DnsKind::Other,
+        Some(header) => classify_reply(header.rcode, header.ancount),
+        None => DnsKind::Other,
+    }
+}
+
+fn check_dns(fqdn: &str) -> Outcome {
+    let Some(server) = system_nameserver() else {
+        return dns_error();
+    };
+    let Some(addr) = parse_nameserver(&server) else {
+        return dns_error();
+    };
+    let kinds = thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(3);
+        for qtype in [DNS_QTYPE_A, DNS_QTYPE_AAAA, DNS_QTYPE_NS] {
+            let name = fqdn.to_string();
+            joins.push(scope.spawn(move || query_record(addr, &name, qtype)));
+        }
+        let mut out = [DnsKind::Other; 3];
+        for (index, join) in joins.into_iter().enumerate() {
+            out[index] = join.join().unwrap_or(DnsKind::Other);
+        }
+        out
+    });
+    dns_outcome(kinds)
 }
 
 fn json_res(status: u16, v: &Json) -> Response {
@@ -398,5 +604,55 @@ mod tests {
         req.set_test_body(b"not-json".to_vec());
         let res = handle(&req, "0.0.0.0", &rate);
         assert_eq!(res.status, 400);
+    }
+
+    #[test]
+    fn dns_records_are_taken() {
+        let out = dns_outcome([DnsKind::NoData, DnsKind::NoData, DnsKind::Found]);
+        assert_eq!(out.available, Some(false));
+        assert_eq!(out.status, "taken");
+    }
+
+    #[test]
+    fn dns_nxdomain_is_available() {
+        let out = dns_outcome([DnsKind::NxDomain, DnsKind::Other, DnsKind::ServFail]);
+        assert_eq!(out.available, Some(true));
+        assert_eq!(out.status, "available");
+    }
+
+    #[test]
+    fn dns_all_nodata_is_inconclusive() {
+        let out = dns_outcome([DnsKind::NoData, DnsKind::NoData, DnsKind::NoData]);
+        assert_eq!(out.available, None);
+        assert_eq!(out.status, "dns-inconclusive");
+    }
+
+    #[test]
+    fn dns_mixed_failure_is_inconclusive() {
+        let out = dns_outcome([DnsKind::NoData, DnsKind::Other, DnsKind::Refused]);
+        assert_eq!(out.available, None);
+        assert_eq!(out.status, "dns-inconclusive");
+    }
+
+    #[test]
+    fn nameserver_skips_comments() {
+        let text = "# comment\noptions timeout:1\nnameserver 127.0.0.53\n";
+        assert_eq!(first_nameserver(text), Some("127.0.0.53"));
+    }
+
+    #[test]
+    fn dns_header_nxdomain_with_no_answers() {
+        let mut buf = vec![0x12, 0x34, 0x81, 0x83, 0, 1, 0, 0, 0, 0, 0, 0];
+        let header = parse_dns_header(&buf, 0x1234).unwrap();
+        assert!(header.rcode == 3 && header.ancount == 0 && !header.truncated);
+        assert_eq!(classify_reply(header.rcode, header.ancount), DnsKind::NxDomain);
+        buf[2] = 0x01;
+        assert!(parse_dns_header(&buf, 0x1234).is_none());
+    }
+
+    #[test]
+    fn build_query_rejects_empty_labels() {
+        assert!(build_query(1, "example.com", DNS_QTYPE_A).is_some());
+        assert!(build_query(1, "foo..com", DNS_QTYPE_NS).is_none());
     }
 }

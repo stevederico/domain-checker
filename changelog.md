@@ -1,5 +1,11 @@
 ## CHANGELOG
 
+5.7.0
+
+  Match DNS fallback
+  Fix doc links
+  Update README commands
+
 5.6.0
 
   Upgrade skateboard 5.6.0

@@ -1,7 +1,7 @@
 {
   "name": "domain-checker",
   "private": false,
-  "version": "5.6.0",
+  "version": "5.7.0",
   "skateboardVersion": "5.6.0",
   "type": "module",
   "scripts": {

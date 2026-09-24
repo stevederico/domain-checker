@@ -477,30 +477,30 @@ Apps own their `vite.config.ts` directly. See [reference implementation](https:/
 - **`src/components/HomeView.tsx`** — Domain checker UI. Debounced input (300ms), concurrent API calls, two-column result grid with `DomainRow` component
 - **`src/constants.json`** — App config. `noLogin: true` (no auth required)
 
-### Backend (`backend/server.ts`)
+### Backend (`backend/src/routes.rs`, `backend/src/check.rs`)
 
-Hono server on port 8000. The domain check logic is the custom part; the rest is standard skateboard boilerplate (auth, Stripe, CSRF, etc.).
+Zero-crate Rust server on port 8000. Domain check is the custom part. Auth, Stripe, and CSRF are skateboard boilerplate.
 
-**Domain check endpoint:** `POST /api/check` with JSON body `{ "domain": "name" }`
+**Domain check endpoint:** `POST /api/check` with JSON body `{ "domain": "name" }`. Dispatched from `routes.rs` to `check::handle`.
 
 **Three-tier lookup strategy:**
 
-1. **RDAP** — For `.dev` and `.app` (no WHOIS server) via `pubapi.registry.google`. HTTP 200 = taken, 404 = available.
-2. **WHOIS** — For 10 other TLDs via raw TCP port 43 queries using Node.js `net` module. Parses response for known available/taken patterns.
-3. **DNS** — Fallback if WHOIS/RDAP fail. Checks A/AAAA/NS records via `dns.promises.resolve`. Less authoritative.
+1. **RDAP** — For `.dev` and `.app` (no WHOIS server) via `pubapi.registry.google`. HTTP 200 = taken, 404 = available. System `curl`, 5 second cap.
+2. **WHOIS** — For 10 other TLDs via raw TCP port 43. Parses response for known available/taken patterns. 5 second timeout.
+3. **DNS** — Fallback if WHOIS/RDAP fail. UDP query to the first system resolver for A, AAAA, and NS. A record in any answer means taken. `NXDOMAIN` means likely available. Anything else stays unknown.
 
-**Key constants and maps:**
+**Key constants and maps** in `check.rs`:
 - `WHOIS_SERVERS` — Maps 10 TLDs to their WHOIS server hostnames
 - `RDAP_SERVERS` — Maps `.dev` and `.app` to `pubapi.registry.google/rdap/domain/`
-- `WHOIS_AVAILABLE_PATTERNS` / `WHOIS_TAKEN_PATTERNS` — Text patterns for parsing WHOIS responses
-- `WHOIS_TIMEOUT_MS` / `RDAP_TIMEOUT_MS` — 5 second timeouts
+- `WHOIS_AVAILABLE` / `WHOIS_TAKEN` — Text patterns for parsing WHOIS responses
+- `WHOIS_TIMEOUT` / `DNS_TIMEOUT` — 5 second WHOIS cap, 2 second per DNS query
 
 **Key functions:**
-- `queryWhois(server, domain)` — Raw TCP WHOIS query
-- `checkDomainWhois(tld, fqdn)` — WHOIS lookup + response parsing
-- `checkDomainRdap(tld, fqdn)` — RDAP HTTP lookup (.dev, .app)
-- `checkDomainDNS(fqdn)` — DNS resolution fallback
-- `checkSingleDomain(tld, name)` — Orchestrates RDAP → WHOIS → DNS per TLD
+- `check_whois` — WHOIS lookup + response parsing
+- `check_rdap` — RDAP HTTP lookup (.dev, .app)
+- `check_dns` — DNS resolution fallback
+- `check_one` — Orchestrates RDAP, then WHOIS, then DNS per TLD
+- `handle` — `POST /api/check`
 
 **Response format:**
 ```json
@@ -734,7 +734,7 @@ Canonical pins live in this repo’s `package.json` (`version` / `skateboardVers
 
 ## Documentation
 
-**Reference:** [docs/GUIDE.md](docs/GUIDE.md) - Architecture, API, Schema, Deployment, Migration (consolidated)
+**Reference:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/API.md](docs/API.md), [docs/SCHEMA.md](docs/SCHEMA.md), [docs/DEPLOY.md](docs/DEPLOY.md), [docs/MIGRATION.md](docs/MIGRATION.md)
 
 **Version:**
 - skateboard@5.6.0
