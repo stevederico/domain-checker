@@ -136,6 +136,10 @@ Check domain availability across all supported TLDs.
 
 **Method values:** `whois`, `rdap`, `dns`
 
+**Status values:** `available`, `taken`, `whois-unclear`, `dns-inconclusive`, `dns-error`, `error`
+
+`available` is `null` for unclear WHOIS text, an inconclusive DNS fallback, or a DNS error.
+
 **Rate limit:** 30 requests per minute per IP.
 
 **Validation:**

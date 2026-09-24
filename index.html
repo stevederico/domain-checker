@@ -22,28 +22,19 @@
     <meta name="twitter:description" content="{{TAGLINE}}">
     <meta name="twitter:image" content="/icons/icon.png">
 
-    <!-- Prevent dark mode flash -->
-    <script>
-      (function() {
-        const savedTheme = localStorage.getItem('theme');
-        const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-        const isDark = savedTheme ? savedTheme === 'dark' : systemPrefersDark;
+    <!-- Prevent dark mode flash (classic script: blocks parse, CSP 'self' only). -->
+    <script src="/theme-init.js"></script>
 
-        if (isDark) {
-          document.documentElement.classList.add('dark');
-        }
-      })();
-    </script>
-
+    <!-- Paint the theme background before the stylesheet resolves; no opacity gate, so a
+         failed CSS load degrades to unstyled content instead of a blank page. -->
     <style>
-      body { background: oklch(0.985 0 0); }
+      body { background: oklch(0.985 0 0); height: 100%; overscroll-behavior: none; }
       .dark body { background: oklch(0.05 0 0); }
-      #root { opacity: 0; }
     </style>
 
-    <script defer type="module" src="/src/main.tsx"></script>
+    <script type="module" src="/src/main.tsx"></script>
   </head>
-  <body style="height: 100%; overscroll-behavior: none;">
+  <body>
     <div id="root"></div>
   </body>
 </html>

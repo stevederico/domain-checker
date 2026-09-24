@@ -43,4 +43,8 @@ deno.lock
 
 MIGRATION_GUIDE-0.9.8.md
 SKATEBOARD_UI_EXTENSIONS_PROPOSAL.md
+
+# Build & tooling artifacts
+coverage
 bun.lock
+backend/target

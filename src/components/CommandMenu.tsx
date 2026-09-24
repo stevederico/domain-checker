@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
-import { useNavigate } from 'react-router';
 import { getState } from '@stevederico/skateboard-ui/Context';
+import { useSafeNavigate } from '@stevederico/skateboard-ui/Utilities';
 import {
   Command,
   CommandDialog,
@@ -11,7 +11,15 @@ import {
   CommandItem,
   CommandShortcut,
 } from '@stevederico/skateboard-ui/shadcn/ui/command';
-import DynamicIcon from '@stevederico/skateboard-ui/DynamicIcon';
+import { Circle, Search } from 'lucide-react';
+
+/**
+ * Lucide icons addressable by the `icon` strings used in constants.json pages.
+ *
+ * skateboard-ui 5.0 removed the public dynamic icon resolver, so app code maps
+ * its own constants strings to named imports. Unknown names fall back to Circle.
+ */
+const PAGE_ICONS: Record<string, typeof Search> = { search: Search };
 
 /** Page entry from constants.json's pages array. */
 interface PageEntry {
@@ -39,7 +47,7 @@ interface PageEntry {
  */
 export default function CommandMenu() {
   const [open, setOpen] = useState(false);
-  const navigate = useNavigate();
+  const navigate = useSafeNavigate();
   const { state } = getState();
   const pages: PageEntry[] = state.constants?.pages || [];
 
@@ -90,7 +98,10 @@ export default function CommandMenu() {
                 onSelect={() => handleSelect(page.url)}
                 className="gap-3 px-3 py-2.5"
               >
-                <DynamicIcon name={page.icon} size={16} className="shrink-0 text-muted-foreground" />
+                {(() => {
+                  const Icon = PAGE_ICONS[page.icon] ?? Circle;
+                  return <Icon size={16} aria-hidden="true" className="shrink-0 text-muted-foreground" />;
+                })()}
                 <span>{page.title}</span>
               </CommandItem>
             ))}

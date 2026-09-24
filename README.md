@@ -28,7 +28,7 @@ The backend uses a three-tier lookup strategy for authoritative results:
 
 1. **WHOIS** (TCP port 43) — Primary method for 10 TLDs. Queries authoritative WHOIS servers directly.
 2. **RDAP** (HTTP) — Used for TLDs without WHOIS servers (`.dev`, `.app`). Queries the registry's RDAP endpoint directly.
-3. **DNS** (fallback) — Last resort if WHOIS/RDAP are unreachable. Checks A/AAAA/NS records. Less authoritative since registered domains with no DNS records appear available.
+3. **DNS** (fallback) — Last resort if WHOIS/RDAP are unreachable. Queries A, AAAA, and NS. Less authoritative. `NXDOMAIN` is likely available. Any answer, including NS only, is taken. Other resolver results stay unknown.
 
 All 12 TLDs are checked concurrently. Results are sorted with available domains first.
 
@@ -51,10 +51,10 @@ Frontend runs at `http://localhost:5173`, backend at `http://localhost:8000`.
 ## Development
 
 ```bash
-npm run start          # Start both frontend and backend
-npm run front          # Frontend only (Vite on :5173)
-npm run server         # Backend only (Hono on :8000)
-npm run build          # Production build
+npm run start             # Frontend (Vite on :5173)
+npm run front             # Same as start
+cd backend && cargo run   # Backend only (Rust on :8000)
+npm run build             # Production frontend build
 ```
 
 ## Project Structure
@@ -63,17 +63,18 @@ npm run build          # Production build
 domain-checker/
 ├── src/
 │   ├── components/
-│   │   └── HomeView.jsx    # Domain checker UI
+│   │   └── HomeView.tsx    # Domain checker UI
 │   ├── assets/
 │   │   └── styles.css      # Theme overrides
-│   ├── main.jsx            # Route config
+│   ├── main.tsx            # Route config
 │   └── constants.json      # App config
 ├── backend/
-│   ├── server.js           # Hono server + domain lookup logic
-│   ├── adapters/           # Database adapters
+│   ├── src/check.rs        # WHOIS, RDAP, and DNS lookup
+│   ├── src/routes.rs       # HTTP routes, including POST /api/check
+│   ├── Cargo.toml          # Empty dependency list
 │   └── config.json         # Backend config
 ├── package.json
-└── vite.config.js
+└── vite.config.ts
 ```
 
 ## Tech Stack
@@ -81,12 +82,11 @@ domain-checker/
 | Technology | Purpose |
 |---|---|
 | React 19 | Frontend UI |
-| Vite 7.1 | Build & dev server |
+| Vite 8 | Build & dev server |
 | Tailwind CSS 4 | Styling |
 | skateboard-ui | Application shell framework |
-| Hono | Backend HTTP server |
-| Node.js `net` | Raw TCP WHOIS queries |
-| Node.js `dns` | DNS resolution fallback |
+| Rust (`std::net`) | Backend HTTP server, WHOIS, and DNS |
+| system `curl` | RDAP lookups for `.dev` and `.app` |
 
 ## API
 

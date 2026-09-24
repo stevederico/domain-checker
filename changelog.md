@@ -1,5 +1,38 @@
 ## CHANGELOG
 
+5.8.0
+
+  Match check limiter
+  Clean stale limits
+  Match TLD order
+  Follow RDAP redirects
+  Decode WHOIS bytes
+
+5.7.0
+
+  Match DNS fallback
+  Fix doc links
+  Update README commands
+
+5.6.0
+
+  Upgrade skateboard 5.6.0
+  Catch worker panics
+  Cap request wall clock
+  Bound Stripe job queue
+  Allowlist checkout keys
+
+5.4.0
+
+  Migrate skateboard 5.4.0
+  Replace Hono Rust backend
+  Pin skateboard-ui 5.1.0
+  Port check endpoint
+  Rewrite icons lucide-react
+  Split legal json
+  Move theme bootstrap public
+  Drop vitest swc
+
 0.5.0
 
   Refresh domain-checker skill
