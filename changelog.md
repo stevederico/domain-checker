@@ -1,5 +1,13 @@
 ## CHANGELOG
 
+5.8.0
+
+  Match check limiter
+  Clean stale limits
+  Match TLD order
+  Follow RDAP redirects
+  Decode WHOIS bytes
+
 5.7.0
 
   Match DNS fallback

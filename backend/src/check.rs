@@ -23,6 +23,10 @@ const CHECK_RATE_WINDOW_MS: i64 = 60 * 1000;
 const CHECK_RATE_MAX_ENTRIES: usize = 10_000;
 
 const WHOIS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Matches `RDAP_TIMEOUT_MS` on the Hono handler.
+const RDAP_TIMEOUT_SECS: &str = "5";
+/// Node `fetch` follows redirects. Undici's default cap is 10.
+const RDAP_MAX_REDIRECTS: &str = "10";
 /// Per-query budget for the DNS fallback. Three record types run in parallel.
 const DNS_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_QTYPE_A: u16 = 1;
@@ -50,8 +54,10 @@ const RDAP_SERVERS: &[(&str, &str)] = &[
     ("app", "https://pubapi.registry.google/rdap/domain/"),
 ];
 
+/// WHOIS TLDs first, then RDAP-only TLDs. Same order as `Object.keys` on the
+/// Hono maps, so a stable availability sort matches the old response order.
 const SUPPORTED_TLDS: &[&str] = &[
-    "com", "net", "org", "io", "dev", "app", "co", "xyz", "ai", "shop", "site", "tech",
+    "com", "net", "org", "io", "co", "xyz", "ai", "shop", "site", "tech", "dev", "app",
 ];
 
 const WHOIS_AVAILABLE: &[&str] = &[
@@ -91,33 +97,65 @@ impl CheckRateStore {
     }
 
     /// Record one request. `limited` means this one is refused and not stored.
+    ///
+    /// Eviction runs after a stored hit and scores each IP by its newest
+    /// timestamp, matching `evictOldestEntries` in the Hono middleware.
     pub fn check_and_record(&self, ip: &str, now_ms: i64) -> bool {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let window_start = now_ms - CHECK_RATE_WINDOW_MS;
-        if !map.contains_key(ip) && map.len() >= CHECK_RATE_MAX_ENTRIES {
-            evict_oldest_entries(&mut map, CHECK_RATE_MAX_ENTRIES.saturating_sub(1), |times| {
-                times.first().copied().unwrap_or(0)
+        let limited = {
+            let times = map.entry(ip.to_string()).or_default();
+            times.retain(|&t| t > window_start);
+            if times.len() >= CHECK_RATE_LIMIT {
+                true
+            } else {
+                times.push(now_ms);
+                false
+            }
+        };
+        if !limited {
+            evict_oldest_entries(&mut map, CHECK_RATE_MAX_ENTRIES, |times| {
+                times.last().copied().unwrap_or(0)
             });
         }
-        let times = map.entry(ip.to_string()).or_default();
-        times.retain(|&t| t > window_start);
-        if times.len() >= CHECK_RATE_LIMIT {
-            return true;
-        }
-        times.push(now_ms);
-        false
+        limited
+    }
+
+    /// Drop IPs whose timestamps have all left the window.
+    ///
+    /// The Hono server did this on a 5 minute timer. Returns how many IPs were removed.
+    pub fn cleanup(&self, now_ms: i64) -> usize {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = map.len();
+        let window_start = now_ms - CHECK_RATE_WINDOW_MS;
+        map.retain(|_, times| {
+            times.retain(|&t| t > window_start);
+            !times.is_empty()
+        });
+        before.saturating_sub(map.len())
+    }
+
+    #[cfg(test)]
+    fn contains(&self, ip: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(ip)
     }
 }
 
 /// Dispatch POST `/api/check`.
+///
+/// The Hono `checkRateLimit` middleware runs before the handler, so a body
+/// that would be 400 still consumes a slot and can be answered 429.
 pub fn handle(req: &Request, ip: &str, rate: &CheckRateStore) -> Response {
+    if rate.check_and_record(ip, crate::config::now_ms()) {
+        return err_json(429, "Rate limit exceeded. Try again shortly.");
+    }
     let name = match parse_domain_name(req) {
         Ok(n) => n,
         Err(res) => return res,
     };
-    if rate.check_and_record(ip, crate::config::now_ms()) {
-        return err_json(429, "Rate limit exceeded. Try again shortly.");
-    }
     let mut results = check_all(&name);
     results.sort_by_key(|r| match r.available {
         Some(true) => 0,
@@ -134,7 +172,7 @@ fn parse_domain_name(req: &Request) -> Result<String, Response> {
     let Some(raw) = body.get_str("domain").filter(|s| !s.is_empty()) else {
         return Err(err_json(400, "Missing domain in request body"));
     };
-    let name = raw.to_ascii_lowercase().replace(|c: char| c.is_ascii_whitespace(), "");
+    let name = normalize_domain(raw);
     if !valid_label(&name) {
         return Err(err_json(
             400,
@@ -142,6 +180,14 @@ fn parse_domain_name(req: &Request) -> Result<String, Response> {
         ));
     }
     Ok(name)
+}
+
+/// Lowercase and strip every whitespace character, including non-ASCII.
+///
+/// Matches `toLowerCase().trim().replace(/\s+/g, '')` on the Hono handler.
+fn normalize_domain(raw: &str) -> String {
+    let stripped: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    stripped.to_lowercase()
 }
 
 fn valid_label(name: &str) -> bool {
@@ -272,9 +318,16 @@ fn check_whois(server: &str, fqdn: &str) -> Option<Outcome> {
     stream.set_read_timeout(Some(WHOIS_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(WHOIS_TIMEOUT)).ok()?;
     write!(stream, "{fqdn}\r\n").ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    Some(parse_whois(&body))
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).ok()?;
+    Some(parse_whois(&decode_whois(&body)))
+}
+
+/// WHOIS bodies are not guaranteed UTF-8. Node's socket encoding replaces bad
+/// bytes and still parses the text. Failing the read here would skip a taken
+/// answer and fall through to DNS.
+fn decode_whois(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn check_rdap(base: &str, fqdn: &str) -> Option<Outcome> {
@@ -282,14 +335,15 @@ fn check_rdap(base: &str, fqdn: &str) -> Option<Outcome> {
     let output = Command::new("curl")
         .args([
             "-sS",
+            "-L",
+            "--max-redirs",
+            RDAP_MAX_REDIRECTS,
             "-o",
             "/dev/null",
             "-w",
             "%{http_code}",
             "-m",
-            "5",
-            "--max-redirs",
-            "0",
+            RDAP_TIMEOUT_SECS,
             "-H",
             "Accept: application/rdap+json",
             "-A",
@@ -651,8 +705,88 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "queries the system resolver"]
+    fn live_dns_marks_example_com_taken() {
+        let out = check_dns("example.com");
+        assert_eq!(out.method, "dns");
+        assert_eq!(out.available, Some(false));
+        assert_eq!(out.status, "taken");
+    }
+
+    #[test]
+    #[ignore = "queries the system resolver"]
+    fn live_dns_nxdomain_is_available() {
+        let out = check_dns("no-such-domain-zz-domain-checker.example");
+        assert_eq!(out.method, "dns");
+        assert_eq!(out.available, Some(true));
+        assert_eq!(out.status, "available");
+    }
+
+    #[test]
     fn build_query_rejects_empty_labels() {
         assert!(build_query(1, "example.com", DNS_QTYPE_A).is_some());
         assert!(build_query(1, "foo..com", DNS_QTYPE_NS).is_none());
+    }
+
+    #[test]
+    fn tld_order_matches_the_hono_maps() {
+        assert_eq!(
+            SUPPORTED_TLDS,
+            [
+                "com", "net", "org", "io", "co", "xyz", "ai", "shop", "site", "tech", "dev", "app",
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_domain_strips_unicode_space_and_lowercases() {
+        assert_eq!(normalize_domain(" Ex Ample "), "example");
+        assert_eq!(normalize_domain("foo\u{00a0}bar"), "foobar");
+    }
+
+    #[test]
+    fn whois_invalid_utf8_still_parses() {
+        let mut bytes = b"No match".to_vec();
+        bytes.push(0xff);
+        let out = parse_whois(&decode_whois(&bytes));
+        assert_eq!(out.available, Some(true));
+        assert_eq!(out.method, "whois");
+    }
+
+    #[test]
+    fn invalid_body_counts_toward_the_rate_limit() {
+        let rate = CheckRateStore::new();
+        for _ in 0..30 {
+            let mut req = Request::for_test("POST", "/api/check");
+            req.set_test_body(b"not-json".to_vec());
+            assert_eq!(handle(&req, "9.9.9.9", &rate).status, 400);
+        }
+        let mut blocked = Request::for_test("POST", "/api/check");
+        blocked.set_test_body(b"not-json".to_vec());
+        assert_eq!(handle(&blocked, "9.9.9.9", &rate).status, 429);
+    }
+
+    #[test]
+    fn cleanup_drops_expired_ips_only() {
+        let store = CheckRateStore::new();
+        assert!(!store.check_and_record("old", 1_000));
+        assert!(!store.check_and_record("new", 120_000));
+        assert_eq!(store.cleanup(120_000), 1);
+        assert!(!store.contains("old"));
+        assert!(store.contains("new"));
+    }
+
+    #[test]
+    fn full_store_evicts_the_ip_with_the_oldest_latest_hit() {
+        let store = CheckRateStore::new();
+        for i in 0..CHECK_RATE_MAX_ENTRIES - 1 {
+            assert!(!store.check_and_record(&format!("recent-{i}"), 100));
+            assert!(!store.check_and_record(&format!("recent-{i}"), 5_000));
+        }
+        assert!(!store.check_and_record("stale", 2_000));
+        assert!(!store.check_and_record("fresh", 9_000));
+        assert!(store.contains("fresh"));
+        assert!(store.contains("recent-0"));
+        assert!(!store.contains("stale"));
     }
 }
