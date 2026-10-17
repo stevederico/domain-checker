@@ -8,7 +8,7 @@ description: >
   availability, wants to find a domain name, or mentions registering a domain.
 allowed-tools: Bash(curl:*), Bash(whois:*), Bash(*domain-checker/scripts/check.sh*)
 metadata:
-  version: "1.2"
+  version: "1.3"
 ---
 
 # Domain Checker
@@ -34,6 +34,15 @@ curl -s -X POST https://checker.bixbyapps.com/api/check \
   -H "Content-Type: application/json" \
   -A "Claude-Agent" \
   -d '{"domain": "example"}'
+```
+
+Only need some TLDs? Add `"tlds"`. Fewer registry queries, faster:
+
+```bash
+curl -s -X POST https://checker.bixbyapps.com/api/check \
+  -H "Content-Type: application/json" \
+  -A "Claude-Agent" \
+  -d '{"domain": "example", "tlds": ["com", "ai"]}'
 ```
 
 Response is an array sorted available-first (`available` true/false/null, `status`, `method`).

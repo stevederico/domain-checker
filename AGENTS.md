@@ -481,7 +481,7 @@ Apps own their `vite.config.ts` directly. See [reference implementation](https:/
 
 Zero-crate Rust server on port 8000. Domain check is the custom part. Auth, Stripe, and CSRF are skateboard boilerplate.
 
-**Domain check endpoint:** `POST /api/check` with JSON body `{ "domain": "name" }`. Dispatched from `routes.rs` to `check::handle`.
+**Domain check endpoint:** `POST /api/check` with JSON body `{ "domain": "name", "tlds"?: ["com", "ai"] }`. Omitting `tlds` checks all 12. Dispatched from `routes.rs` to `check::handle`; `parse_check_body` validates the body.
 
 **Three-tier lookup strategy:**
 

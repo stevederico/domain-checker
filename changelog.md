@@ -1,5 +1,11 @@
 ## CHANGELOG
 
+5.9.0
+
+  Add TLD filter
+  Document tlds param
+  Update skill example
+
 5.8.0
 
   Match check limiter

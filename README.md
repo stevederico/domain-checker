@@ -92,10 +92,11 @@ domain-checker/
 
 ### `POST /api/check`
 
-Check domain availability across all supported TLDs.
+Check domain availability across all supported TLDs, or only the ones you list.
 
 **Request body (JSON):**
 - `domain` — Base domain name (alphanumeric + hyphens, max 63 chars)
+- `tlds` (optional) — Array of supported TLDs to check, e.g. `["com", "ai"]`. Omit for all 12
 
 **Response:**
 ```json

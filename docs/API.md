@@ -105,14 +105,17 @@ Sign out current user.
 ### Domain Check
 
 #### POST /api/check
-Check domain availability across all supported TLDs.
+Check domain availability across all supported TLDs, or only the ones in `tlds`.
 
 **Request Body:**
 ```json
 {
-  "domain": "example"
+  "domain": "example",
+  "tlds": ["com", "ai"]
 }
 ```
+
+`tlds` is optional. Omit it to check all 12. Results only include the listed TLDs, so each name sends fewer registry queries.
 
 **Response (200):**
 ```json
@@ -144,6 +147,7 @@ Check domain availability across all supported TLDs.
 
 **Validation:**
 - `domain`: Alphanumeric + hyphens, max 63 characters
+- `tlds`: Non-empty array of supported TLDs (`com`, `net`, `org`, `io`, `co`, `xyz`, `ai`, `shop`, `site`, `tech`, `dev`, `app`). Case and a leading dot are ignored. Anything else is a 400
 
 ---
 

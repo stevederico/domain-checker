@@ -152,11 +152,11 @@ pub fn handle(req: &Request, ip: &str, rate: &CheckRateStore) -> Response {
     if rate.check_and_record(ip, crate::config::now_ms()) {
         return err_json(429, "Rate limit exceeded. Try again shortly.");
     }
-    let name = match parse_domain_name(req) {
-        Ok(n) => n,
+    let (name, tlds) = match parse_check_body(req) {
+        Ok(v) => v,
         Err(res) => return res,
     };
-    let mut results = check_all(&name);
+    let mut results = check_all(&name, &tlds);
     results.sort_by_key(|r| match r.available {
         Some(true) => 0,
         Some(false) => 1,
@@ -167,8 +167,48 @@ pub fn handle(req: &Request, ip: &str, rate: &CheckRateStore) -> Response {
         .set_header("Pragma", "no-cache")
 }
 
-fn parse_domain_name(req: &Request) -> Result<String, Response> {
+/// Parse `{ "domain": "name", "tlds"?: ["com", "ai"] }`.
+///
+/// Returns the normalized label and the TLDs to check, in `SUPPORTED_TLDS`
+/// order. A missing `tlds` means all of them. Fewer TLDs means fewer
+/// registry queries per name.
+///
+/// # Errors
+/// 400 for invalid JSON, a missing or invalid domain, or a `tlds` value that
+/// is not a non-empty array of supported TLD strings.
+fn parse_check_body(req: &Request) -> Result<(String, Vec<&'static str>), Response> {
     let body = json::parse(&req.body).map_err(|_| err_json(400, "Invalid JSON body"))?;
+    let name = parse_domain_name(&body)?;
+    let tlds = match body.get("tlds") {
+        None => SUPPORTED_TLDS.to_vec(),
+        Some(v) => parse_tlds(v)?,
+    };
+    Ok((name, tlds))
+}
+
+fn parse_tlds(v: &Json) -> Result<Vec<&'static str>, Response> {
+    let bad = || {
+        let list = SUPPORTED_TLDS.join(", ");
+        err_json(400, &format!("Invalid tlds. Use an array of: {list}."))
+    };
+    let items = v.as_arr().filter(|a| !a.is_empty()).ok_or_else(bad)?;
+    let mut wanted = Vec::with_capacity(items.len());
+    for item in items {
+        let raw = item.as_str().ok_or_else(bad)?;
+        let tld = raw.trim().trim_start_matches('.').to_ascii_lowercase();
+        if !SUPPORTED_TLDS.contains(&tld.as_str()) {
+            return Err(bad());
+        }
+        wanted.push(tld);
+    }
+    Ok(SUPPORTED_TLDS
+        .iter()
+        .copied()
+        .filter(|t| wanted.iter().any(|w| w == t))
+        .collect())
+}
+
+fn parse_domain_name(body: &Json) -> Result<String, Response> {
     let Some(raw) = body.get_str("domain").filter(|s| !s.is_empty()) else {
         return Err(err_json(400, "Missing domain in request body"));
     };
@@ -227,9 +267,9 @@ impl CheckResult {
     }
 }
 
-fn check_all(name: &str) -> Vec<CheckResult> {
+fn check_all(name: &str, tlds: &[&'static str]) -> Vec<CheckResult> {
     thread::scope(|s| {
-        let handles: Vec<_> = SUPPORTED_TLDS
+        let handles: Vec<_> = tlds
             .iter()
             .map(|tld| s.spawn(|| check_one(tld, name)))
             .collect();
@@ -658,6 +698,33 @@ mod tests {
         req.set_test_body(b"not-json".to_vec());
         let res = handle(&req, "0.0.0.0", &rate);
         assert_eq!(res.status, 400);
+    }
+
+    fn tlds_of(body: &str) -> Result<Vec<&'static str>, u16> {
+        let mut req = Request::for_test("POST", "/api/check");
+        req.set_test_body(body.as_bytes().to_vec());
+        parse_check_body(&req).map(|(_, t)| t).map_err(|r| r.status)
+    }
+
+    #[test]
+    fn tlds_default_to_all_supported() {
+        assert_eq!(tlds_of(r#"{"domain":"x"}"#), Ok(SUPPORTED_TLDS.to_vec()));
+    }
+
+    #[test]
+    fn tlds_filter_keeps_supported_order_and_dedupes() {
+        assert_eq!(
+            tlds_of(r#"{"domain":"x","tlds":["ai",".COM","ai"]}"#),
+            Ok(vec!["com", "ai"])
+        );
+    }
+
+    #[test]
+    fn tlds_reject_unknown_empty_and_non_arrays() {
+        assert_eq!(tlds_of(r#"{"domain":"x","tlds":["com","zz"]}"#), Err(400));
+        assert_eq!(tlds_of(r#"{"domain":"x","tlds":[]}"#), Err(400));
+        assert_eq!(tlds_of(r#"{"domain":"x","tlds":"com"}"#), Err(400));
+        assert_eq!(tlds_of(r#"{"domain":"x","tlds":[1]}"#), Err(400));
     }
 
     #[test]
