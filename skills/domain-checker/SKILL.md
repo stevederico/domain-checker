@@ -59,7 +59,7 @@ Present as a table:
 From the domain-checker repo, generate spellable names locally and check them through the API:
 
 ```bash
-npm run hunt -- --count 200 --len 5 --require any
+npm run hunt -- --count 200 --len 5
 ```
 
 See the README "Name Hunt" section for flags. Results are cached in `~/.cache/domain-checker/hunt.jsonl`.

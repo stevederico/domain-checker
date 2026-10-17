@@ -1,5 +1,9 @@
 ## CHANGELOG
 
+5.11.0
+
+  Default require any
+
 5.10.0
 
   Add name hunt

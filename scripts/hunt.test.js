@@ -79,8 +79,8 @@ describe('generateNames', () => {
 
 describe('parseArgs', () => {
   it('reads flags', () => {
-    const opts = parseArgs(['--len', '3-4', '--tlds', '.com,ai', '--require', 'any', '--dry-run']);
-    assert.deepEqual([opts.minLen, opts.maxLen, opts.tlds, opts.require, opts.dryRun], [3, 4, ['com', 'ai'], 'any', true]);
+    const opts = parseArgs(['--len', '3-4', '--tlds', '.com,ai', '--require', 'all', '--dry-run']);
+    assert.deepEqual([opts.minLen, opts.maxLen, opts.tlds, opts.require, opts.dryRun], [3, 4, ['com', 'ai'], 'all', true]);
   });
 
   it('rejects junk', () => {

@@ -6,7 +6,7 @@
  * Domain Checker API with a `tlds` filter. Nothing else sees the names.
  *
  *   npm run hunt -- --count 200
- *   npm run hunt -- --source words --require any
+ *   npm run hunt -- --source words
  *   npm run hunt -- --seeds agent,nova --len 4-6
  *
  * Every result is appended to a local cache so a name is never sent twice.
@@ -52,7 +52,7 @@ const DEFAULTS = {
   count: 100,
   minLen: 4,
   maxLen: 5,
-  require: 'all',
+  require: 'any',
   seeds: [],
   source: 'invented',
   words: DEFAULT_WORDS,

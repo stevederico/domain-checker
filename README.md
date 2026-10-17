@@ -125,8 +125,8 @@ Check domain availability across all supported TLDs, or only the ones you list.
 `scripts/hunt.mjs` finds short names that are easy to spell. It makes the names on your machine, then checks each one through `POST /api/check` with a `tlds` filter. No other service sees them.
 
 ```bash
-npm run hunt -- --count 200                     # invented names, 4-5 letters, .com + .ai both free
-npm run hunt -- --len 5 --require any           # print a name if any TLD is free
+npm run hunt -- --count 200                     # invented names, 4-5 letters, .com or .ai free
+npm run hunt -- --len 5 --require all           # only print names free on every TLD
 npm run hunt -- --source words                  # real words and first names from a local list
 npm run hunt -- --seeds agent,nova --len 4-6    # blends like "novio", "agenx"
 npm run hunt -- --dry-run --count 20            # print names, check nothing
@@ -137,7 +137,7 @@ npm run hunt -- --dry-run --count 20            # print names, check nothing
 | `--count` | `100` | Names to check |
 | `--len` | `4-5` | Length range (`5` or `4-6`) |
 | `--tlds` | `com,ai` | TLDs to check |
-| `--require` | `all` | `all` TLDs free, or `any` |
+| `--require` | `any` | `any` TLD free, or `all` |
 | `--source` | `invented` | `invented` spellable names, or `words` from `--words` |
 | `--words` | `/usr/share/dict/cracklib-small` | Word list for `--source words` |
 | `--seeds` | none | Comma-separated roots to blend first |
