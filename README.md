@@ -120,6 +120,32 @@ Check domain availability across all supported TLDs, or only the ones you list.
 
 **Method values:** `whois`, `rdap`, `dns`
 
+## Name Hunt
+
+`scripts/hunt.mjs` finds short names that are easy to spell. It makes the names on your machine, then checks each one through `POST /api/check` with a `tlds` filter. No other service sees them.
+
+```bash
+npm run hunt -- --count 200                     # invented names, 4-5 letters, .com + .ai both free
+npm run hunt -- --len 5 --require any           # print a name if any TLD is free
+npm run hunt -- --source words                  # real words and first names from a local list
+npm run hunt -- --seeds agent,nova --len 4-6    # blends like "novio", "agenx"
+npm run hunt -- --dry-run --count 20            # print names, check nothing
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--count` | `100` | Names to check |
+| `--len` | `4-5` | Length range (`5` or `4-6`) |
+| `--tlds` | `com,ai` | TLDs to check |
+| `--require` | `all` | `all` TLDs free, or `any` |
+| `--source` | `invented` | `invented` spellable names, or `words` from `--words` |
+| `--words` | `/usr/share/dict/cracklib-small` | Word list for `--source words` |
+| `--seeds` | none | Comma-separated roots to blend first |
+| `--api` | `https://checker.bixbyapps.com/api/check` | Use `http://localhost:8000/api/check` for a local backend |
+| `--cache` | `~/.cache/domain-checker/hunt.jsonl` | Every result, so no name is sent twice |
+
+Invented names use letters with one obvious spelling (no c/k/q/h/j/w/y), hard `g` only before a/o/u, `s`/`z` only at the start, and end in a, o, n, r, l, or x. Calls are spaced 2.1s apart to stay under the 30/min limit. A 429 waits 61s, a 5xx backs off 2s, 4s, 8s, and 3 failed names in a row stop the run.
+
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.

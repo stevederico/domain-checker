@@ -8,7 +8,7 @@ description: >
   availability, wants to find a domain name, or mentions registering a domain.
 allowed-tools: Bash(curl:*), Bash(whois:*), Bash(*domain-checker/scripts/check.sh*)
 metadata:
-  version: "1.3"
+  version: "1.4"
 ---
 
 # Domain Checker
@@ -53,6 +53,16 @@ Present as a table:
 |--------|--------|
 | example.dev | Available |
 | example.com | Taken |
+
+## Bulk hunt for short names
+
+From the domain-checker repo, generate spellable names locally and check them through the API:
+
+```bash
+npm run hunt -- --count 200 --len 5 --require any
+```
+
+See the README "Name Hunt" section for flags. Results are cached in `~/.cache/domain-checker/hunt.jsonl`.
 
 ## Method 2 — Local script (fallback)
 

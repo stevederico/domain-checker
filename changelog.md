@@ -1,5 +1,12 @@
 ## CHANGELOG
 
+5.10.0
+
+  Add name hunt
+  Generate spellable names
+  Cache checked names
+  Document hunt flags
+
 5.9.0
 
   Add TLD filter
