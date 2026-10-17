@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkName, generateNames, isHit, loadWords, parseArgs, readCache, seedNames, spellableName } from './hunt.mjs';
+import { checkName, generateNames, isHit, loadWords, parseArgs, patternName, readCache, seedNames, spellableName } from './hunt.mjs';
 
 /** Deterministic PRNG so generated names are stable across runs. */
 const seeded = (seed) => () => {
@@ -36,6 +36,22 @@ describe('spellableName', () => {
 
   it('only opens with a vowel when it is a or o', () => {
     assert.ok(names.every((n) => !/^[eiu]/.test(n)), names.find((n) => /^[eiu]/.test(n)));
+  });
+});
+
+describe('patternName', () => {
+  const names = Array.from({ length: 200 }, (_, i) => patternName(['CVCVx', 'VCVx', 'CCVxV'][i % 3], seeded(i + 1)));
+
+  it('keeps literals and the pattern length', () => {
+    assert.ok(names.every((n, i) => n && n.length === [5, 4, 5][i % 3] && n.includes('x')));
+  });
+
+  it('opens a VCVx name with a or o', () => {
+    assert.ok(names.filter((_, i) => i % 3 === 1).every((n) => /^[ao]/.test(n)));
+  });
+
+  it('never fills a soft g, a doubled letter, or two x', () => {
+    assert.ok(names.every((n) => !/g[ei]|([a-z])\1|x.*x/.test(n)), names.find((n) => /g[ei]|([a-z])\1|x.*x/.test(n)));
   });
 });
 
@@ -84,7 +100,7 @@ describe('parseArgs', () => {
   });
 
   it('rejects junk', () => {
-    for (const bad of [['--bogus', '1'], ['--len', '6-4'], ['--require', 'most'], ['--source', 'web'], ['--count']]) {
+    for (const bad of [['--bogus', '1'], ['--len', '6-4'], ['--require', 'most'], ['--source', 'web'], ['--pattern', 'CVX!'], ['--count']]) {
       assert.throws(() => parseArgs(bad));
     }
   });

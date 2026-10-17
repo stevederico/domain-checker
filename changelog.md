@@ -1,5 +1,10 @@
 ## CHANGELOG
 
+5.12.0
+
+  Add pattern flag
+  Redraw double x
+
 5.11.0
 
   Default require any

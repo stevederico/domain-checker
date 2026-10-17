@@ -515,7 +515,7 @@ Zero-crate Rust server on port 8000. Domain check is the custom part. Auth, Stri
 
 ### Name hunt (`scripts/hunt.mjs`)
 
-CLI that generates short, spellable names locally (`spellableName`, `seedNames`, `loadWords`) and checks them one at a time through `POST /api/check` with `tlds`. Spaced 2.1s apart for the 30/min limit, 61s wait on 429, 2s/4s/8s backoff on 5xx, circuit breaker after 3 failed names. Results append to `~/.cache/domain-checker/hunt.jsonl` so names are never resent. Tests: `scripts/hunt.test.js`.
+CLI that generates short, spellable names locally (`spellableName`, `patternName`, `seedNames`, `loadWords`) and checks them one at a time through `POST /api/check` with `tlds`. Spaced 2.1s apart for the 30/min limit, 61s wait on 429, 2s/4s/8s backoff on 5xx, circuit breaker after 3 failed names. Results append to `~/.cache/domain-checker/hunt.jsonl` so names are never resent. Tests: `scripts/hunt.test.js`.
 
 ### UI Indicators (HomeView.tsx → DomainRow component)
 

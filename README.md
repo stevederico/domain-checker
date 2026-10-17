@@ -129,6 +129,7 @@ npm run hunt -- --count 200                     # invented names, 4-5 letters, .
 npm run hunt -- --len 5 --require all           # only print names free on every TLD
 npm run hunt -- --source words                  # real words and first names from a local list
 npm run hunt -- --seeds agent,nova --len 4-6    # blends like "novio", "agenx"
+npm run hunt -- --pattern CVCVx,CVxVC --tlds com # x names like "lumax", "taxon"
 npm run hunt -- --dry-run --count 20            # print names, check nothing
 ```
 
@@ -141,6 +142,7 @@ npm run hunt -- --dry-run --count 20            # print names, check nothing
 | `--source` | `invented` | `invented` spellable names, or `words` from `--words` |
 | `--words` | `/usr/share/dict/cracklib-small` | Word list for `--source words` |
 | `--seeds` | none | Comma-separated roots to blend first |
+| `--pattern` | none | Letter patterns: `C` consonant, `V` vowel, a-z kept as is, leading `CC` a cluster. `VCVx` gives "apex" shapes. Overrides `--len` |
 | `--api` | `https://checker.bixbyapps.com/api/check` | Use `http://localhost:8000/api/check` for a local backend |
 | `--cache` | `~/.cache/domain-checker/hunt.jsonl` | Every result, so no name is sent twice |
 

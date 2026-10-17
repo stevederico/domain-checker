@@ -8,6 +8,7 @@
  *   npm run hunt -- --count 200
  *   npm run hunt -- --source words
  *   npm run hunt -- --seeds agent,nova --len 4-6
+ *   npm run hunt -- --pattern CVCVx,CVxVC --tlds com
  *
  * Every result is appended to a local cache so a name is never sent twice.
  */
@@ -36,6 +37,8 @@ const END_CONSONANTS = ['n', 'r', 'l', 'x'];
 const SUFFIXES = ['a', 'o', 'io', 'ix', 'ly', 'er', 'on', 'ra', 'us', 'an'];
 /** Default word list for `--source words`: ships with cracklib on Arch, has words and first names. */
 const DEFAULT_WORDS = '/usr/share/dict/cracklib-small';
+/** Max redraws when a pattern fill breaks a spelling rule. */
+const PATTERN_TRIES = 20;
 /** Spacing between API calls. The server allows 30 per minute per IP. */
 const REQUEST_GAP_MS = 2100;
 /** Wait after a 429. The server window is 60 seconds. */
@@ -55,6 +58,7 @@ const DEFAULTS = {
   require: 'any',
   seeds: [],
   source: 'invented',
+  patterns: [],
   words: DEFAULT_WORDS,
   tlds: ['com', 'ai'],
   dryRun: false,
@@ -105,6 +109,36 @@ export function spellableName(len, rand = Math.random) {
     }
   }
   return s;
+}
+
+/**
+ * Fill a letter pattern with spellable letters.
+ *
+ * `C` is a consonant, `V` a vowel, and lowercase letters are kept as is, so
+ * `CVCVx` gives names like "lumax" and `VCVx` gives "apex". A leading `CC`
+ * is one opening cluster ("bl", "tr"). The same rules as `spellableName`
+ * apply: an opening vowel is a or o, a final vowel is a or o, a final
+ * consonant is n/r/l/x, and fills with a soft g, a doubled letter, or two x's are redrawn.
+ *
+ * @param {string} pattern - Letters from `C`, `V`, and a-z.
+ * @param {() => number} rand - Random source returning [0, 1).
+ * @returns {string|null} A name, or null when no clean fill was found.
+ */
+export function patternName(pattern, rand = Math.random) {
+  for (let tries = 0; tries < PATTERN_TRIES; tries++) {
+    const startsWithCluster = pattern.startsWith('CC');
+    let s = startsWithCluster ? pick(ONSET_CLUSTERS, rand) : '';
+    for (let i = s.length; i < pattern.length; i++) {
+      const slot = pattern[i];
+      const isFirst = i === 0;
+      const isLast = i === pattern.length - 1;
+      if (slot === 'V') s += isFirst || isLast ? pick(END_VOWELS, rand) : pick(VOWELS, rand);
+      else if (slot === 'C') s += isLast ? pick(END_CONSONANTS, rand) : pick(isFirst ? [...CONSONANTS, ...START_ONLY] : CONSONANTS, rand);
+      else s += slot;
+    }
+    if (!/g[ei]|([a-z])\1|x.*x/.test(s)) return s;
+  }
+  return null;
 }
 
 /**
@@ -170,7 +204,8 @@ export function shuffle(arr, rand = Math.random) {
  * Produce up to `count` fresh candidate names.
  *
  * Seed blends come first. Then either shuffled list words (`source: words`)
- * or invented spellable names (`source: invented`) fill the rest.
+ * or invented spellable names (`source: invented`) fill the rest. Invented
+ * names follow `patterns` when given, and `minLen`/`maxLen` otherwise.
  *
  * @param {object} opts - Same shape as `DEFAULTS`.
  * @param {Set<string>} skip - Names already checked.
@@ -187,7 +222,10 @@ export function generateNames(opts, skip = new Set(), rand = Math.random) {
   }
   // Invented names can collide with the cache, so cap attempts instead of looping forever.
   for (let tries = 0; out.size < opts.count && tries < opts.count * 50; tries++) {
-    add(spellableName(opts.minLen + Math.floor(rand() * (opts.maxLen - opts.minLen + 1)), rand));
+    const name = opts.patterns.length
+      ? patternName(pick(opts.patterns, rand), rand)
+      : spellableName(opts.minLen + Math.floor(rand() * (opts.maxLen - opts.minLen + 1)), rand);
+    if (name) add(name);
   }
   return [...out];
 }
@@ -214,6 +252,7 @@ export function parseArgs(argv) {
     else if (flag === '--len') [opts.minLen, opts.maxLen = opts.minLen] = v.split('-').map(Number);
     else if (flag === '--tlds') opts.tlds = list(v);
     else if (flag === '--seeds') opts.seeds = list(v);
+    else if (flag === '--pattern') opts.patterns = v.split(',').map((x) => x.trim()).filter(Boolean);
     else if (['--require', '--source', '--words', '--api', '--cache'].includes(flag)) opts[flag.slice(2)] = v;
     else throw new Error(`Unknown flag ${flag}`);
   }
@@ -221,6 +260,7 @@ export function parseArgs(argv) {
   if (!(opts.minLen >= 1 && opts.maxLen <= 63 && opts.minLen <= opts.maxLen)) throw new Error('--len must look like 4-5');
   if (!['all', 'any'].includes(opts.require)) throw new Error('--require must be all or any');
   if (!['invented', 'words'].includes(opts.source)) throw new Error('--source must be invented or words');
+  if (opts.patterns.some((x) => !/^[CVa-z]{1,63}$/.test(x))) throw new Error('--pattern uses C, V, and a-z, like CVCVx');
   return opts;
 }
 
