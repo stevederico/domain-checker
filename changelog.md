@@ -1,5 +1,9 @@
 ## CHANGELOG
 
+5.12.2
+
+  Pin base images
+
 5.12.1
 
   Remove isSubscriber route doc
