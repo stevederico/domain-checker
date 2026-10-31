@@ -1,5 +1,10 @@
 ## CHANGELOG
 
+5.12.1
+
+  Remove isSubscriber route doc
+  Point to usage check
+
 5.12.0
 
   Add pattern flag

@@ -153,17 +153,7 @@ Check domain availability across all supported TLDs, or only the ones in `tlds`.
 
 ### Subscription
 
-#### GET /api/isSubscriber
-Check if current user has active subscription.
-
-**Response (200):**
-```json
-{ "isSubscriber": true }
-```
-or
-```json
-{ "isSubscriber": false }
-```
+There is no separate subscription-status route. Read it from `POST /api/usage` with `{"operation":"check"}` (below): `isSubscriber` is `true` when the user's subscription status is `active` and its period end has not passed (no period end counts as current), otherwise `false`. `trialing` is not counted as paid.
 
 ---
 
