@@ -1,5 +1,9 @@
 ## CHANGELOG
 
+5.12.4
+
+  Bump debian runtime base to bookworm-20261104-slim (apt 2.6.2)
+
 5.12.3
 
   Bump skateboard-ui 5.11.4
