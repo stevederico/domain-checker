@@ -10,8 +10,8 @@ import {
   CommandGroup,
   CommandItem,
   CommandShortcut,
-} from '@stevederico/skateboard-ui/shadcn/ui/command';
-import { Circle, Search } from 'lucide-react';
+} from '@stevederico/skateboard-ui/ui/command';
+import { Circle, Search } from '@stevederico/skateboard-ui/icons';
 
 /**
  * Lucide icons addressable by the `icon` strings used in constants.json pages.

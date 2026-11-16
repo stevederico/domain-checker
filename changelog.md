@@ -1,5 +1,17 @@
 ## CHANGELOG
 
+5.13.0
+
+  Bump skateboard-ui 5.19.0
+  Icons from skateboard-ui
+  Router from skateboard-ui
+  Rewrite shadcn imports
+  Plain CSS
+  Drop Tailwind
+  Drop lucide-react
+  Drop react-router
+  Drop @types/node
+
 5.12.4
 
   Bump debian runtime base to bookworm-20261104-slim (apt 2.6.2)

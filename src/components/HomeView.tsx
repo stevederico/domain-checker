@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import type { ChangeEvent } from 'react';
 import { toast } from 'sonner';
-import { Input } from '@stevederico/skateboard-ui/shadcn/ui/input';
-import { Spinner } from '@stevederico/skateboard-ui/shadcn/ui/spinner';
-import { Kbd } from '@stevederico/skateboard-ui/shadcn/ui/kbd';
+import { Input } from '@stevederico/skateboard-ui/ui/input';
+import { Spinner } from '@stevederico/skateboard-ui/ui/spinner';
+import { Kbd } from '@stevederico/skateboard-ui/ui/kbd';
 
 const TLDS = ['com', 'net', 'org', 'io', 'dev', 'app', 'co', 'xyz', 'ai', 'shop', 'site', 'tech'];
 
