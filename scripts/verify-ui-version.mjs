@@ -1,8 +1,4 @@
 #!/usr/bin/env node
-/**
- * Fail if installed @stevederico/skateboard-ui does not match package.json,
- * or if Deno install artifacts are still present. Run from an app root (cwd).
- */
 import { verifyUiVersion } from './verify-ui-version.ts';
 
 const result = verifyUiVersion();

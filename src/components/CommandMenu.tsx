@@ -9,42 +9,17 @@ import {
   CommandEmpty,
   CommandGroup,
   CommandItem,
-  CommandShortcut,
 } from '@stevederico/skateboard-ui/ui/command';
-import { Circle, Search } from '@stevederico/skateboard-ui/icons';
+import { Circle, Search } from '../icons';
 
-/**
- * Lucide icons addressable by the `icon` strings used in constants.json pages.
- *
- * skateboard-ui 5.0 removed the public dynamic icon resolver, so app code maps
- * its own constants strings to named imports. Unknown names fall back to Circle.
- */
 const PAGE_ICONS: Record<string, typeof Search> = { search: Search };
 
-/** Page entry from constants.json's pages array. */
 interface PageEntry {
   title: string;
   url: string;
   icon: string;
 }
 
-/**
- * Global command menu activated via Cmd+K (Mac) or Ctrl+K (Windows).
- *
- * Renders a searchable command palette overlay that lists all app pages
- * from constants.json. Selecting a page navigates to its route under /app/.
- *
- * Uses cmdk under the hood via skateboard-ui's Command primitives.
- * The keyboard listener is global, so this component works regardless
- * of which route is currently active.
- *
- * @component
- * @returns Command dialog with page navigation
- *
- * @example
- * // Add to any layout or view — keyboard shortcut is global
- * <CommandMenu />
- */
 export default function CommandMenu() {
   const [open, setOpen] = useState(false);
   const navigate = useSafeNavigate();
@@ -52,10 +27,6 @@ export default function CommandMenu() {
   const pages: PageEntry[] = state.constants?.pages || [];
 
   useEffect(() => {
-    /**
-     * Toggle command menu on Cmd+K / Ctrl+K keydown.
-     * @param e - Native keyboard event
-     */
     function handleKeyDown(e: KeyboardEvent) {
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
         e.preventDefault();
@@ -67,10 +38,6 @@ export default function CommandMenu() {
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  /**
-   * Navigate to the selected page and close the menu.
-   * @param url - Route path relative to /app/
-   */
   const handleSelect = useCallback(
     (url: string) => {
       navigate(`/app/${url}`);

@@ -1,8 +1,3 @@
-//! HTTP route handlers — zero-crate port of `backend/server.ts`.
-//!
-//! One function per route. Status codes, JSON error bodies, and cookie
-//! attributes match the Node server so a parity harness can byte-diff them.
-
 use std::collections::BTreeMap;
 
 use crate::auth::{self, JwtError, JwtPayload, TOKEN_EXPIRATION_DAYS};
@@ -19,7 +14,6 @@ use crate::stripe;
 use crate::stripe_worker::OwnedCheckoutParams;
 use crate::validation;
 
-/// Dispatch one request: CORS, security headers, routes, access log.
 pub fn handle(state: &AppState, req: Request) -> Response {
     let start = config::now_ms();
     middleware::dev_request_log(&state.log, &req, state.prod);
@@ -62,8 +56,6 @@ fn dispatch(state: &AppState, req: &Request) -> Response {
     }
 }
 
-/// Liveness plus a real database round-trip, so a container healthcheck fails when
-/// SQLite is unreachable instead of reporting a process that cannot serve anything.
 fn health(state: &AppState) -> Response {
     let (status, database) = match state.pool.ping() {
         Ok(()) => (200, "connected"),
@@ -96,10 +88,6 @@ fn err_json(status: u16, msg: &str) -> Response {
     json_res(status, &json::obj([("error", json::s(msg))]))
 }
 
-/// Map a Stripe worker / client error to an HTTP response.
-///
-/// Timeouts answer 504 so a slow Stripe cannot look like an application bug;
-/// every other failure stays 500 with a generic body.
 fn stripe_err(state: &AppState, log_msg: &str, e: crate::stripe::StripeError) -> Response {
     state
         .log
@@ -136,10 +124,41 @@ fn parse_json_body(req: &Request) -> Result<Json, Response> {
     json::parse(&req.body).map_err(|_| err_json(400, "Invalid request body"))
 }
 
-fn generate_csrf_token() -> Result<String, Response> {
-    crypto::random_bytes(32)
-        .map(|b| crypto::hex_encode(&b))
-        .map_err(|_| err_json(500, "Server error"))
+fn generate_csrf_token(state: &AppState, user_id: &str) -> Result<String, Response> {
+    let Some(secret) = state.jwt_secret.as_deref() else {
+        return Err(err_json(500, "Server error"));
+    };
+    let issued = config::now_ms();
+    Ok(format!("{issued}.{}", csrf_mac(secret, user_id, issued)))
+}
+
+fn csrf_mac(secret: &str, user_id: &str, issued: i64) -> String {
+    let msg = format!("csrf:{user_id}:{issued}");
+    crypto::hex_encode(&crypto::hmac_sha256(secret.as_bytes(), msg.as_bytes()))
+}
+
+#[derive(Debug, PartialEq)]
+enum CsrfCheck {
+    Valid,
+    Expired,
+    Invalid,
+}
+
+fn check_csrf_token(secret: &str, user_id: &str, token: &str, now_ms: i64) -> CsrfCheck {
+    let Some((issued, mac)) = token.split_once('.') else {
+        return CsrfCheck::Invalid;
+    };
+    let Ok(issued) = issued.parse::<i64>() else {
+        return CsrfCheck::Invalid;
+    };
+    let expected = csrf_mac(secret, user_id, issued);
+    if mac.len() != expected.len() || !ct_eq(mac.as_bytes(), expected.as_bytes()) {
+        return CsrfCheck::Invalid;
+    }
+    if now_ms - issued > CSRF_TOKEN_EXPIRY_MS || issued - now_ms > 60_000 {
+        return CsrfCheck::Expired;
+    }
+    CsrfCheck::Valid
 }
 
 fn generate_uuid() -> Result<String, Response> {
@@ -186,20 +205,6 @@ fn require_auth(state: &AppState, req: &Request) -> Result<String, Response> {
     }
 }
 
-/// CSRF check for a state-changing request.
-///
-/// A token that is missing, mismatched, unknown to the store, or expired is
-/// refused with 403. The refusal carries a freshly minted token as a cookie
-/// whenever the caller's identity is known, so a client whose token was lost —
-/// the in-memory store does not survive a restart — can retry once and succeed.
-///
-/// Deliberately *not* done here: accepting the request and regenerating the
-/// token on a store miss. That turns every post-restart request into a free
-/// pass, because the stored token is what the header is checked against.
-///
-/// # Errors
-/// A 403 [`Response`], ready to return, with a replacement cookie when one
-/// could be issued.
 fn require_csrf(state: &AppState, req: &Request, user_id: &str) -> Result<(), Response> {
     if req.method == "GET" || req.path == "/api/signup" || req.path == "/api/signin" {
         return Ok(());
@@ -217,59 +222,40 @@ fn require_csrf(state: &AppState, req: &Request, user_id: &str) -> Result<(), Re
         return Err(err_json(403, "Invalid CSRF token"));
     }
     let csrf_header = csrf_header.unwrap_or("");
-    let Some(stored) = state.csrf.get(user_id) else {
-        state.log.info(
-            "CSRF validation failed - no token on record for this user",
-            &[
-                ("userID", json::s(user_id)),
-                ("path", json::s(req.path.clone())),
-            ],
-        );
-        return Err(csrf_retry(state, user_id, "CSRF token expired"));
-    };
-    if csrf_header.len() != stored.token.len()
-        || !ct_eq(csrf_header.as_bytes(), stored.token.as_bytes())
-    {
-        state.log.info(
-            "CSRF validation failed - token mismatch",
-            &[
-                ("userID", json::s(user_id)),
-                ("path", json::s(req.path.clone())),
-            ],
-        );
+    let Some(secret) = state.jwt_secret.as_deref() else {
         return Err(err_json(403, "Invalid CSRF token"));
-    }
-    if config::now_ms() - stored.timestamp > CSRF_TOKEN_EXPIRY_MS {
-        state.log.info(
-            "CSRF validation failed - token expired",
-            &[
-                ("userID", json::s(user_id)),
-                (
-                    "age",
-                    json::s(format!("{}s", (config::now_ms() - stored.timestamp) / 1000)),
-                ),
-            ],
-        );
-        return Err(csrf_retry(state, user_id, "CSRF token expired"));
+    };
+    match check_csrf_token(secret, user_id, csrf_header, config::now_ms()) {
+        CsrfCheck::Valid => {}
+        CsrfCheck::Invalid => {
+            state.log.info(
+                "CSRF validation failed - token mismatch",
+                &[
+                    ("userID", json::s(user_id)),
+                    ("path", json::s(req.path.clone())),
+                ],
+            );
+            return Err(csrf_retry(state, user_id, "Invalid CSRF token"));
+        }
+        CsrfCheck::Expired => {
+            state.log.info(
+                "CSRF validation failed - token expired",
+                &[
+                    ("userID", json::s(user_id)),
+                    ("path", json::s(req.path.clone())),
+                ],
+            );
+            return Err(csrf_retry(state, user_id, "CSRF token expired"));
+        }
     }
     state.log.debug("CSRF validation passed", &[("userID", json::s(user_id))]);
     Ok(())
 }
 
-/// Build a 403 that also hands the caller a usable token for one retry.
-///
-/// Falls back to a plain 403 when a token cannot be minted, so a failure of the
-/// random source can never turn into an accepted request.
 fn csrf_retry(state: &AppState, user_id: &str, message: &str) -> Response {
-    match generate_csrf_token() {
-        Ok(token) => {
-            state.csrf.set(user_id, token.clone(), config::now_ms());
-            err_json(403, message).cookie(&csrf_cookie(state, &token))
-        }
-        Err(_) => {
-            state.csrf.remove(user_id);
-            err_json(403, message)
-        }
+    match generate_csrf_token(state, user_id) {
+        Ok(token) => err_json(403, message).cookie(&csrf_cookie(state, &token)),
+        Err(_) => err_json(403, message),
     }
 }
 
@@ -310,8 +296,7 @@ fn delete_csrf_cookie(state: &AppState) -> Cookie {
 }
 
 fn set_auth_cookies(state: &AppState, res: Response, user_id: &str, jwt: &str) -> Result<Response, Response> {
-    let csrf = generate_csrf_token()?;
-    state.csrf.set(user_id, csrf.clone(), config::now_ms());
+    let csrf = generate_csrf_token(state, user_id)?;
     Ok(res.cookie(&token_cookie(state, jwt)).cookie(&csrf_cookie(state, &csrf)))
 }
 
@@ -407,9 +392,6 @@ fn signup(state: &AppState, req: &Request) -> Response {
         password: hash,
         user_id: insert_id.clone(),
     };
-    // One transaction, so a failure cannot leave a user row with no credentials
-    // — an account nobody can sign in to, holding an email address that can
-    // never be registered again.
     if let Err(e) = state.pool.create_account(&user, &auth_rec) {
         if is_duplicate(&e) {
             state.log.warn("Signup failed - duplicate account", &[]);
@@ -541,13 +523,9 @@ fn signout(state: &AppState, req: &Request) -> Response {
         Ok(id) => id,
         Err(r) => return r,
     };
-    // Sign-out changes server state, so it is CSRF-protected like any other
-    // mutation. A refusal still hands back a usable token, so a client holding a
-    // stale one can retry immediately rather than being stuck signed in.
     if let Err(res) = require_csrf(state, req, &user_id) {
         return res;
     }
-    state.csrf.remove(&user_id);
     state.log.info("Signout success", &[]);
     json_res(200, &json::obj([("message", json::s("Signed out successfully"))]))
         .cookie(&delete_token_cookie(state))
@@ -560,8 +538,19 @@ fn me_get(state: &AppState, req: &Request) -> Response {
         Err(r) => return r,
     };
     state.log.debug("/me checking for user", &[]);
-    match state.pool.find_user(&UserQuery::Id(user_id)) {
-        Ok(Some(u)) => json_res(200, &user_json(&u)),
+    match state.pool.find_user(&UserQuery::Id(user_id.clone())) {
+        Ok(Some(u)) => {
+            let res = json_res(200, &user_json(&u));
+            let current = req.cookie("csrf_token").unwrap_or_default();
+            let secret = state.jwt_secret.as_deref().unwrap_or_default();
+            if check_csrf_token(secret, &user_id, &current, config::now_ms()) == CsrfCheck::Valid {
+                return res;
+            }
+            match generate_csrf_token(state, &user_id) {
+                Ok(token) => res.cookie(&csrf_cookie(state, &token)),
+                Err(err) => err,
+            }
+        }
         Ok(None) => err_json(404, "User not found"),
         Err(e) => db_err(state, "Unhandled error occurred", &e),
     }
@@ -575,8 +564,6 @@ fn me_put(state: &AppState, req: &Request) -> Response {
     if let Err(res) = require_csrf(state, req, &user_id) {
         return res;
     }
-    // A malformed body is the caller's mistake, so it answers 400 like every other
-    // JSON route — not the 500 an earlier revision returned.
     let body = match parse_json_body(req) {
         Ok(v) => v,
         Err(r) => return r,
@@ -631,8 +618,11 @@ fn resolve_usage(user: &User) -> Usage {
     })
 }
 
+const PAID_STATUSES: &[&str] = &["active", "trialing"];
+
 fn is_subscriber(sub: &Subscription) -> bool {
-    sub.status == "active" && sub.expires.map(|e| e > config::now_secs()).unwrap_or(true)
+    PAID_STATUSES.contains(&sub.status.as_str())
+        && sub.expires.map(|e| e > config::now_secs()).unwrap_or(true)
 }
 
 fn sub_expires_iso(sub: &Subscription) -> Json {
@@ -642,10 +632,8 @@ fn sub_expires_iso(sub: &Subscription) -> Json {
     }
 }
 
-/// Length of a free-tier usage window, in seconds (30 days).
 const USAGE_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
 
-/// The 429 body returned when a free-tier caller has no quota left.
 fn usage_limit_reached(limit: i64) -> Response {
     json_res(
         429,
@@ -663,9 +651,6 @@ fn usage(state: &AppState, req: &Request) -> Response {
         Ok(id) => id,
         Err(r) => return r,
     };
-    // `operation: "track"` increments a stored counter, so this is a mutation.
-    // The body is parsed as JSON regardless of Content-Type, which means a
-    // cross-site form post could otherwise reach it without a preflight.
     if let Err(res) = require_csrf(state, req, &user_id) {
         return res;
     }
@@ -707,15 +692,11 @@ fn usage(state: &AppState, req: &Request) -> Response {
     let now = config::now_secs();
     let mut usage = resolve_usage(&user);
     let is_tracking = operation == "track";
-    // A limit below 1 admits nothing, including the first request of a new
-    // window — which the window reset below would otherwise wave through.
     if is_tracking && limit < 1 {
         return usage_limit_reached(limit);
     }
     if usage.reset_at.map(|r| now > r).unwrap_or(true) {
         let new_reset = now + USAGE_WINDOW_SECS;
-        // Reset and first increment together: a separate increment could be
-        // issued by a concurrent request and then erased by this reset.
         match state
             .pool
             .reset_usage_window(&user_id, new_reset, is_tracking)
@@ -729,8 +710,6 @@ fn usage(state: &AppState, req: &Request) -> Response {
             Err(e) => return db_err(state, "Usage tracking error", &e),
         }
     } else if is_tracking {
-        // The limit is enforced inside the UPDATE, so concurrent requests
-        // cannot both be admitted at the boundary.
         match state.pool.consume_usage(&user_id, limit) {
             Ok(Some(count)) => usage.count = count,
             Ok(None) => return usage_limit_reached(limit),
@@ -866,11 +845,6 @@ fn portal(state: &AppState, req: &Request) -> Response {
             return err_json(500, "Stripe portal failed");
         }
     };
-    // The caller may only manage the Stripe customer recorded against their own
-    // account. Anything else — no user, no subscription, a blank stored id, or a
-    // mismatch — is refused. Defaulting to "allow" when the account has no
-    // subscription would let any signed-in user open a billing portal for an
-    // arbitrary customer id and read or cancel someone else's subscription.
     let stored_id = user
         .as_ref()
         .and_then(|u| u.subscription.as_ref())
@@ -910,40 +884,54 @@ fn period_end(obj: &Json) -> Option<i64> {
     })
 }
 
-fn apply_sub_patch(state: &AppState, email: &str, sub: &Subscription) -> bool {
-    match state.pool.find_user(&UserQuery::Email(email.to_string())) {
-        Ok(Some(u)) => match state.pool.update_user_subscription(&u.id, sub) {
-            Ok(_) => true,
-            Err(e) => {
-                state
-                    .log
-                    .error("Webhook processing error", &[("error", json::s(e.to_string()))]);
-                false
-            }
-        },
+const TAKEOVER_STATUSES: &[&str] = &["active", "trialing"];
+
+fn is_superseded(current: Option<&Subscription>, patch: &Subscription) -> bool {
+    let current_id = current.and_then(|c| c.subscription_id.as_deref());
+    let (Some(current_id), Some(incoming_id)) = (current_id, patch.subscription_id.as_deref())
+    else {
+        return false;
+    };
+    current_id != incoming_id && !TAKEOVER_STATUSES.contains(&patch.status.as_str())
+}
+
+fn apply_sub_patch(state: &AppState, email: &str, sub: &Subscription) -> Result<bool, ()> {
+    let user = match state.pool.find_user(&UserQuery::Email(email.to_string())) {
+        Ok(Some(u)) => u,
         Ok(None) => {
             state
                 .log
                 .warn("Webhook: No user found for email", &[("email", json::s(redact_email(email)))]);
-            false
+            return Ok(false);
         }
         Err(e) => {
             state
                 .log
                 .error("Webhook processing error", &[("error", json::s(e.to_string()))]);
-            false
+            return Err(());
+        }
+    };
+    if is_superseded(user.subscription.as_ref(), sub) {
+        state.log.info(
+            "Webhook: event is for a superseded subscription, ignoring",
+            &[
+                ("subscription", json::s(sub.subscription_id.clone().unwrap_or_default())),
+                ("status", json::s(sub.status.clone())),
+            ],
+        );
+        return Ok(false);
+    }
+    match state.pool.update_user_subscription(&user.id, sub) {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            state
+                .log
+                .error("Webhook processing error", &[("error", json::s(e.to_string()))]);
+            Err(())
         }
     }
 }
 
-/// Mask an email address for logging.
-///
-/// Webhook logs are verbose, shipped off-host, and retained far longer than the
-/// request that produced them, so writing full addresses turns the log into a
-/// copy of the customer list. Keeping the first character and the domain leaves
-/// enough to match a support report against a log line without storing the
-/// address itself. Anything without an `@` is dropped entirely rather than
-/// guessed at.
 fn redact_email(email: &str) -> String {
     let Some((local, domain)) = email.split_once('@') else {
         return "[redacted]".to_string();
@@ -959,6 +947,7 @@ fn build_sub_patch(stripe_id: &str, stripe_sub: &Json) -> Subscription {
         stripe_id: stripe_id.to_string(),
         expires: period_end(stripe_sub),
         status: stripe_sub.get_str("status").unwrap_or("").to_string(),
+        subscription_id: stripe_sub.get_str("id").map(str::to_string),
     }
 }
 
@@ -1020,22 +1009,10 @@ fn payment(state: &AppState, req: &Request) -> Response {
     if let Err(e) = process_webhook(state, &event_id, &event_type, &obj) {
         return e;
     }
-    // Recorded only after the effect has been applied, so the record can never
-    // claim an event was handled when it was not. Recording first and deleting
-    // on failure only covers a returned error: a crash, timeout, or kill
-    // between the insert and the update would leave the event marked as
-    // processed forever, and the retry Stripe sends would be skipped.
-    //
-    // This ordering trades that for the possibility of applying an event twice,
-    // which is safe here because every write these handlers perform sets
-    // subscription columns to absolute values read from Stripe rather than
-    // mutating them relative to what is already stored.
     if let Err(e) = state
         .pool
         .insert_webhook_event(&event_id, &event_type, config::now_ms())
     {
-        // The effect is already applied. Asking Stripe to retry would only
-        // repeat idempotent work, so acknowledge and keep the error visible.
         state.log.error(
             "Applied webhook event but failed to record it - a retry would be reprocessed",
             &[
@@ -1060,6 +1037,21 @@ fn process_webhook(
             | "customer.subscription.updated"
             | "customer.subscription.created"
     ) {
+        let (Some(stripe), Some(subscription_id)) = (stripe, obj.get_str("id")) else {
+            state
+                .log
+                .error("Webhook missing subscription ID", &[("type", json::s(event_type))]);
+            return Err(Response::empty(400));
+        };
+        let sub_json = match stripe.retrieve_subscription(subscription_id) {
+            Ok(v) => v,
+            Err(e) => {
+                state
+                    .log
+                    .error("Webhook processing error", &[("error", json::s(e.to_string()))]);
+                return Err(Response::empty(500));
+            }
+        };
         let Some(stripe_id) = obj.get_str("customer") else {
             state
                 .log
@@ -1071,7 +1063,7 @@ fn process_webhook(
             Ok(None) => return Err(Response::empty(400)),
             Err(_) => return Err(Response::empty(400)),
         };
-        if period_end(obj).is_none() {
+        if period_end(&sub_json).is_none() {
             state.log.error(
                 "Webhook: subscription event has no current_period_end",
                 &[
@@ -1080,12 +1072,8 @@ fn process_webhook(
                 ],
             );
         }
-        let sub = Subscription {
-            stripe_id: stripe_id.to_string(),
-            expires: period_end(obj),
-            status: obj.get_str("status").unwrap_or("").to_string(),
-        };
-        if apply_sub_patch(state, &email, &sub) {
+        let sub = build_sub_patch(stripe_id, &sub_json);
+        if apply_sub_patch(state, &email, &sub).map_err(|()| Response::empty(500))? {
             state.log.info(
                 "Subscription updated",
                 &[
@@ -1121,7 +1109,7 @@ fn process_webhook(
                 }
             };
             let patch = build_sub_patch(stripe_id, &sub_json);
-            if apply_sub_patch(state, &email, &patch) {
+            if apply_sub_patch(state, &email, &patch).map_err(|()| Response::empty(500))? {
                 state.log.info(
                     "Checkout completed",
                     &[
@@ -1157,7 +1145,7 @@ fn process_webhook(
                 Err(_) => return Err(Response::empty(500)),
             };
             let patch = build_sub_patch(stripe_id, &sub_json);
-            if apply_sub_patch(state, &email, &patch) {
+            if apply_sub_patch(state, &email, &patch).map_err(|()| Response::empty(500))? {
                 state.log.info("Invoice paid", &[("email", json::s(redact_email(&email)))]);
             }
         }
@@ -1236,14 +1224,8 @@ fn static_or_spa(state: &AppState, req: &Request) -> Response {
     spa_fallback(state)
 }
 
-/// Production-only cache of `index.html`, which never changes while the process runs.
 static INDEX_HTML: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
-/// Serve the SPA shell for any non-API path.
-///
-/// In production the file is read once and kept in memory — every client-side route
-/// lands here, so re-reading it per request is pure syscall overhead. Development
-/// reads from disk each time so a rebuild shows up without restarting the server.
 fn spa_fallback(state: &AppState) -> Response {
     let read_index = || {
         std::fs::read(state.static_dir.join("index.html"))
@@ -1261,22 +1243,8 @@ fn spa_fallback(state: &AppState) -> Response {
     }
 }
 
-/// Drop expired CSRF tokens. Called from the hourly cleanup thread.
-pub fn run_csrf_cleanup(state: &AppState) {
-    let cleaned = state.csrf.cleanup(config::now_ms());
-    if cleaned > 0 {
-        state.log.debug(
-            "CSRF cleanup completed",
-            &[("removedTokens", json::i(cleaned as i64))],
-        );
-    }
-}
-
-/// Days a processed Stripe webhook id is remembered for replay protection.
-/// Stripe stops retrying an event after ~3 days, so 30 is generous.
 const WEBHOOK_RETENTION_DAYS: i64 = 30;
 
-/// Drop webhook records past [`WEBHOOK_RETENTION_DAYS`]. Called from the hourly thread.
 pub fn run_webhook_cleanup(state: &AppState) {
     let cutoff = config::now_ms() - WEBHOOK_RETENTION_DAYS * 24 * 60 * 60 * 1000;
     match state.pool.prune_webhook_events(cutoff) {
@@ -1290,7 +1258,6 @@ pub fn run_webhook_cleanup(state: &AppState) {
     }
 }
 
-/// Drop expired lockout and auth-rate entries. Called from the 15-minute cleanup thread.
 pub fn run_lockout_cleanup(state: &AppState) {
     let now = config::now_ms();
     let cleaned = state.lockout.cleanup(now);
@@ -1309,20 +1276,6 @@ pub fn run_lockout_cleanup(state: &AppState) {
     }
 }
 
-/// Client IP used for auth rate limiting and lockout keys.
-///
-/// Transport `peer_ip` by default. `TRUST_PROXY` is the number of reverse
-/// proxies in front of this process (`TRUST_PROXY=1` for a single proxy such as
-/// Railway); set it only when every one of those hops is trusted.
-///
-/// Proxies **append** to `X-Forwarded-For`, so the leftmost entry is whatever
-/// the client sent and must never be trusted — rotating it would mint a fresh
-/// rate-limit and lockout bucket per request. Index `hops` from the right
-/// instead: with one trusted proxy that is the address it observed.
-///
-/// Falls back to `peer_ip` when the header is absent or carries fewer entries
-/// than `hops` (a spoofed-short chain then shares the proxy's bucket rather
-/// than escaping into one of its own).
 fn client_ip(req: &Request) -> String {
     let hops = config::env("TRUST_PROXY")
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1342,7 +1295,6 @@ fn client_ip(req: &Request) -> String {
     req.peer_ip.clone()
 }
 
-/// Refuse the request when this IP has exhausted the auth sliding window.
 fn enforce_auth_rate_limit(state: &AppState, req: &Request) -> Result<(), Response> {
     let ip = client_ip(req);
     let status = state.auth_rate.check_and_record(&ip, config::now_ms());
@@ -1365,7 +1317,6 @@ mod tests {
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
-    /// Tests mutate process env; serialize them so they cannot clobber each other.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_state() -> (AppState, std::path::PathBuf) {
@@ -1373,7 +1324,6 @@ mod tests {
         test_state_locked()
     }
 
-    /// Like [`test_state`] but assumes the caller already holds [`ENV_LOCK`].
     fn test_state_locked() -> (AppState, std::path::PathBuf) {
         let n = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("sk-rs-{}-{n}", std::process::id()));
@@ -1417,12 +1367,6 @@ mod tests {
         }
     }
 
-    /// Replay the cookies set by `sources`, in order, with later responses
-    /// overriding earlier ones by cookie name — so an auth cookie from signup
-    /// can be combined with a replacement CSRF cookie from a later response.
-    ///
-    /// `send_csrf` controls whether the matching `x-csrf-token` header is sent,
-    /// which is what separates "client has no token" from "token is stale".
     fn replay_cookies(req: &mut Request, sources: &[&Response], send_csrf: bool) {
         let mut jar: Vec<(String, String)> = Vec::new();
         for res in sources {
@@ -1515,8 +1459,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Sign up, then return the state and the signup response (which carries
-    /// the auth cookies and the CSRF token).
     fn signed_up(state: &AppState, email: &str) -> Response {
         let mut req = Request::for_test("POST", "/api/signup");
         req.set_test_body(
@@ -1527,7 +1469,6 @@ mod tests {
         res
     }
 
-    /// POST `/api/portal` with `customer_id`, carrying the cookies from `signup`.
     fn portal_request(state: &AppState, signup: &Response, customer_id: &str) -> Response {
         let mut req = Request::for_test("POST", "/api/portal");
         cookie_header(&mut req, signup);
@@ -1573,8 +1514,90 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn stale_csrf(token: &str) -> Response {
+        Response::text(200, "").header("Set-Cookie", &format!("csrf_token={token}; Path=/"))
+    }
+
+    const OLD_SCHEME_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     #[test]
-    fn csrf_store_miss_is_refused_not_auto_accepted() {
+    fn csrf_token_round_trips_and_rejects_tampering() {
+        let secret = "s";
+        let issued = 1_000_000;
+        let token = format!("{issued}.{}", csrf_mac(secret, "u1", issued));
+        assert_eq!(check_csrf_token(secret, "u1", &token, issued), CsrfCheck::Valid);
+        assert_eq!(check_csrf_token(secret, "u2", &token, issued), CsrfCheck::Invalid);
+        assert_eq!(check_csrf_token("other", "u1", &token, issued), CsrfCheck::Invalid);
+        assert_eq!(check_csrf_token(secret, "u1", OLD_SCHEME_TOKEN, issued), CsrfCheck::Invalid);
+        assert_eq!(check_csrf_token(secret, "u1", "", issued), CsrfCheck::Invalid);
+        let moved = format!("{}.{}", issued + 1, csrf_mac(secret, "u1", issued));
+        assert_eq!(check_csrf_token(secret, "u1", &moved, issued), CsrfCheck::Invalid);
+        assert_eq!(
+            check_csrf_token(secret, "u1", &token, issued + CSRF_TOKEN_EXPIRY_MS + 1),
+            CsrfCheck::Expired
+        );
+        assert_eq!(check_csrf_token(secret, "u1", &token, issued - 120_000), CsrfCheck::Expired);
+    }
+
+    #[test]
+    fn csrf_token_survives_a_restart() {
+        let (state, dir) = test_state();
+        let signup = signed_up(&state, "restart@example.com");
+        drop(state);
+        let restarted = {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            AppState::open_in(&dir, 2, Logger::new(true)).expect("reopen")
+        };
+        let mut req = Request::for_test("POST", "/api/usage");
+        replay_cookies(&mut req, &[&signup], true);
+        req.set_test_body(br#"{"operation":"check"}"#.to_vec());
+        let res = handle(&restarted, req);
+        assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn me_replaces_a_stale_csrf_token() {
+        let (state, dir) = test_state();
+        let signup = signed_up(&state, "restore@example.com");
+        let stale = stale_csrf(OLD_SCHEME_TOKEN);
+
+        let mut me = Request::for_test("GET", "/api/me");
+        replay_cookies(&mut me, &[&signup, &stale], false);
+        let me_res = handle(&state, me);
+        assert_eq!(me_res.status, 200, "{}", String::from_utf8_lossy(&me_res.body));
+        assert!(
+            me_res.headers.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("Set-Cookie") && v.starts_with("csrf_token=")
+            }),
+            "a stale token on GET /me must get a replacement cookie"
+        );
+
+        let mut usage = Request::for_test("POST", "/api/usage");
+        replay_cookies(&mut usage, &[&signup, &stale, &me_res], true);
+        usage.set_test_body(br#"{"operation":"check"}"#.to_vec());
+        let res = handle(&state, usage);
+        assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn me_keeps_a_valid_csrf_token() {
+        let (state, dir) = test_state();
+        let signup = signed_up(&state, "keep@example.com");
+        let mut me = Request::for_test("GET", "/api/me");
+        replay_cookies(&mut me, &[&signup], false);
+        let me_res = handle(&state, me);
+        assert_eq!(me_res.status, 200);
+        assert!(!me_res
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("Set-Cookie") && v.starts_with("csrf_token=")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn csrf_stale_token_is_refused_not_auto_accepted() {
         let (state, dir) = test_state();
         let signup = signed_up(&state, "miss@example.com");
         let user_id = state
@@ -1583,19 +1606,17 @@ mod tests {
             .expect("query")
             .expect("user")
             .id;
-        // Simulates a restart: the cookie and header survive, the store does not.
-        state.csrf.remove(&user_id);
+        let stale = stale_csrf(OLD_SCHEME_TOKEN);
 
         let mut req = Request::for_test("PUT", "/api/me");
-        replay_cookies(&mut req, &[&signup], true);
+        replay_cookies(&mut req, &[&signup, &stale], true);
         req.set_test_body(br#"{"name":"Renamed"}"#.to_vec());
         let res = handle(&state, req);
         assert_eq!(
             res.status, 403,
-            "a store miss must not accept the request: {}",
+            "a stale token must not accept the request: {}",
             String::from_utf8_lossy(&res.body)
         );
-        // The name must be unchanged, proving the mutation did not run.
         let after = state
             .pool
             .find_user(&UserQuery::Id(user_id))
@@ -1609,23 +1630,16 @@ mod tests {
     fn csrf_refusal_issues_a_token_usable_on_retry() {
         let (state, dir) = test_state();
         let signup = signed_up(&state, "retry@example.com");
-        let user_id = state
-            .pool
-            .find_user(&UserQuery::Email("retry@example.com".into()))
-            .expect("query")
-            .expect("user")
-            .id;
-        state.csrf.remove(&user_id);
+        let stale = stale_csrf(OLD_SCHEME_TOKEN);
 
         let mut first = Request::for_test("PUT", "/api/me");
-        replay_cookies(&mut first, &[&signup], true);
+        replay_cookies(&mut first, &[&signup, &stale], true);
         first.set_test_body(br#"{"name":"Renamed"}"#.to_vec());
         let refused = handle(&state, first);
         assert_eq!(refused.status, 403);
 
-        // Retry with the replacement token the refusal set.
         let mut second = Request::for_test("PUT", "/api/me");
-        replay_cookies(&mut second, &[&signup, &refused], true);
+        replay_cookies(&mut second, &[&signup, &stale, &refused], true);
         second.set_test_body(br#"{"name":"Renamed"}"#.to_vec());
         let res = handle(&state, second);
         assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
@@ -1636,14 +1650,11 @@ mod tests {
     #[test]
     fn portal_refuses_a_customer_id_the_caller_does_not_own() {
         let (mut state, dir) = test_state();
-        // A configured client makes the route reach the authorization check; the
-        // check itself is local, so a refusal never touches the network.
         state.stripe = Some(crate::stripe_worker::StripeWorker::spawn(
             crate::stripe::StripeClient::new("sk_test_unused".into()),
         ));
         let signup = signed_up(&state, "noone@example.com");
 
-        // This account has no subscription, so it owns no Stripe customer.
         let res = portal_request(&state, &signup, "cus_someoneElsesCustomer");
         assert_eq!(res.status, 403, "{}", String::from_utf8_lossy(&res.body));
         assert_eq!(json_body(&res).get_str("error"), Some("Unauthorized customerID"));
@@ -1671,6 +1682,7 @@ mod tests {
                     stripe_id: "cus_mine".into(),
                     expires: None,
                     status: "active".into(),
+                    subscription_id: None,
                 },
             )
             .expect("set subscription");
@@ -1690,8 +1702,6 @@ mod tests {
 
         let mut put = Request::for_test("PUT", "/api/me");
         cookie_header(&mut put, &signed);
-        // cookie_header also copies x-csrf-token from Set-Cookie; strip it to
-        // prove a missing header is rejected.
         put.headers = crate::http::Headers::from_pairs(
             put.headers
                 .iter()
@@ -1739,7 +1749,6 @@ mod tests {
         req.set_test_header("x-forwarded-for", "198.51.100.10");
         req.set_test_body(br#"{"email":"xff-over@example.com","password":"secret1","name":"R"}"#.to_vec());
         assert_eq!(handle(&state, req).status, 429);
-        // Different forwarded IP still allowed (socket peer is the same proxy).
         let mut req = Request::for_test("POST", "/api/signup");
         req.peer_ip = "10.0.0.1".into();
         req.set_test_header("x-forwarded-for", "198.51.100.11");
@@ -1760,12 +1769,9 @@ mod tests {
         }
         let (state, dir) = test_state_locked();
         let now = config::now_ms();
-        // Exhaust the window for the address the single trusted proxy observed.
         for _ in 0..crate::stores::AUTH_RATE_LIMIT {
             assert!(!state.auth_rate.check_and_record("198.51.100.10", now).limited);
         }
-        // The client prepends junk; the proxy appends the address it saw. Taking
-        // the leftmost hop would hand the attacker an unused bucket every time.
         for (i, spoof) in ["203.0.113.1", "203.0.113.2", "203.0.113.3"].iter().enumerate() {
             let mut req = Request::for_test("POST", "/api/signup");
             req.peer_ip = "10.0.0.1".into();
@@ -1791,8 +1797,6 @@ mod tests {
         }
         let (state, dir) = test_state_locked();
         let now = config::now_ms();
-        // Only one hop present but two are configured: fail closed to the socket
-        // peer rather than trusting the client-supplied entry.
         for _ in 0..crate::stores::AUTH_RATE_LIMIT {
             assert!(!state.auth_rate.check_and_record("10.0.0.1", now).limited);
         }
@@ -1913,6 +1917,10 @@ mod tests {
         let mut mock = crate::stripe::StripeMock::default();
         mock.customers
             .insert("cus_new".into(), "subber@example.com".into());
+        mock.subscriptions.insert(
+            "sub_1".into(),
+            r#"{"id":"sub_1","customer":"cus_new","status":"active","current_period_end":1893456000}"#.into(),
+        );
         let (state, dir) = stripe_state_with_mock(mock);
         let _ = signed_up(&state, "subber@example.com");
 
@@ -1933,6 +1941,7 @@ mod tests {
         assert_eq!(sub.stripe_id, "cus_new");
         assert_eq!(sub.status, "active");
         assert_eq!(sub.expires, Some(1_893_456_000));
+        assert_eq!(sub.subscription_id.as_deref(), Some("sub_1"));
 
         assert!(state
             .pool
@@ -1947,13 +1956,25 @@ mod tests {
         let mut mock = crate::stripe::StripeMock::default();
         mock.customers
             .insert("cus_life".into(), "life@example.com".into());
+        mock.customers
+            .insert("cus_gone".into(), "gone@example.com".into());
+        mock.subscriptions.insert(
+            "sub_life".into(),
+            r#"{"id":"sub_life","status":"past_due","current_period_end":1890000000}"#.into(),
+        );
+        mock.subscriptions.insert(
+            "sub_gone".into(),
+            r#"{"id":"sub_gone","status":"canceled","current_period_end":1890000000}"#.into(),
+        );
         let (state, dir) = stripe_state_with_mock(mock);
         let _ = signed_up(&state, "life@example.com");
+        let _ = signed_up(&state, "gone@example.com");
 
         let updated = br#"{
             "id":"evt_sub_updated",
             "type":"customer.subscription.updated",
             "data":{"object":{
+                "id":"sub_life",
                 "customer":"cus_life",
                 "status":"past_due",
                 "current_period_end":1890000000
@@ -1967,13 +1988,14 @@ mod tests {
             "id":"evt_sub_deleted",
             "type":"customer.subscription.deleted",
             "data":{"object":{
-                "customer":"cus_life",
+                "id":"sub_gone",
+                "customer":"cus_gone",
                 "status":"canceled",
                 "current_period_end":1890000000
             }}
         }"#;
         assert_eq!(handle(&state, signed_webhook(deleted)).status, 200);
-        let sub = user_subscription(&state, "life@example.com").expect("sub");
+        let sub = user_subscription(&state, "gone@example.com").expect("sub");
         assert_eq!(sub.status, "canceled");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2007,6 +2029,196 @@ mod tests {
     }
 
     #[test]
+    fn payment_stale_subscription_created_after_checkout_keeps_user_subscribed() {
+        let mut mock = crate::stripe::StripeMock::default();
+        mock.customers
+            .insert("cus_late".into(), "late@example.com".into());
+        mock.subscriptions.insert(
+            "sub_late".into(),
+            r#"{"id":"sub_late","status":"active","current_period_end":1900000000}"#.into(),
+        );
+        let (state, dir) = stripe_state_with_mock(mock);
+        let _ = signed_up(&state, "late@example.com");
+
+        let checkout = br#"{
+            "id":"evt_late_cs",
+            "type":"checkout.session.completed",
+            "data":{"object":{
+                "customer":"cus_late",
+                "customer_email":"late@example.com",
+                "subscription":"sub_late"
+            }}
+        }"#;
+        assert_eq!(handle(&state, signed_webhook(checkout)).status, 200);
+        assert_eq!(user_subscription(&state, "late@example.com").expect("sub").status, "active");
+
+        let stale = br#"{
+            "id":"evt_late_created",
+            "type":"customer.subscription.created",
+            "data":{"object":{
+                "id":"sub_late",
+                "customer":"cus_late",
+                "status":"incomplete",
+                "current_period_end":1897000000
+            }}
+        }"#;
+        let res = handle(&state, signed_webhook(stale));
+        assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+
+        let sub = user_subscription(&state, "late@example.com").expect("sub");
+        assert_eq!(sub.status, "active");
+        assert_eq!(sub.expires, Some(1_900_000_000));
+        assert!(is_subscriber(&sub));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn payment_subscription_event_stripe_error_is_retried() {
+        let mut mock = crate::stripe::StripeMock::default();
+        mock.customers
+            .insert("cus_miss".into(), "miss@example.com".into());
+        let (state, dir) = stripe_state_with_mock(mock);
+        let _ = signed_up(&state, "miss@example.com");
+
+        let payload = br#"{
+            "id":"evt_sub_miss",
+            "type":"customer.subscription.updated",
+            "data":{"object":{
+                "id":"sub_miss",
+                "customer":"cus_miss",
+                "status":"active",
+                "current_period_end":1900000000
+            }}
+        }"#;
+        assert_eq!(handle(&state, signed_webhook(payload)).status, 500);
+        assert!(state
+            .pool
+            .find_webhook_event("evt_sub_miss")
+            .expect("find")
+            .is_none());
+        assert_eq!(user_subscription(&state, "miss@example.com"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn payment_subscription_event_without_id_is_rejected() {
+        let mut mock = crate::stripe::StripeMock::default();
+        mock.customers
+            .insert("cus_noid".into(), "noid@example.com".into());
+        let (state, dir) = stripe_state_with_mock(mock);
+        let _ = signed_up(&state, "noid@example.com");
+
+        let payload = br#"{
+            "id":"evt_sub_noid",
+            "type":"customer.subscription.updated",
+            "data":{"object":{"customer":"cus_noid","status":"active"}}
+        }"#;
+        assert_eq!(handle(&state, signed_webhook(payload)).status, 400);
+        assert_eq!(user_subscription(&state, "noid@example.com"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn payment_old_subscription_deleted_after_resubscribe_keeps_user_subscribed() {
+        let mut mock = crate::stripe::StripeMock::default();
+        mock.customers
+            .insert("cus_old".into(), "again@example.com".into());
+        mock.customers
+            .insert("cus_again".into(), "again@example.com".into());
+        mock.subscriptions.insert(
+            "sub_old".into(),
+            r#"{"id":"sub_old","status":"canceled","current_period_end":1880000000}"#.into(),
+        );
+        mock.subscriptions.insert(
+            "sub_again".into(),
+            r#"{"id":"sub_again","status":"active","current_period_end":1900000000}"#.into(),
+        );
+        let (state, dir) = stripe_state_with_mock(mock);
+        let _ = signed_up(&state, "again@example.com");
+
+        let deleted = |event_id: &str| {
+            format!(
+                r#"{{"id":"{event_id}","type":"customer.subscription.deleted",
+                "data":{{"object":{{"id":"sub_old","customer":"cus_old","status":"canceled"}}}}}}"#
+            )
+        };
+        assert_eq!(handle(&state, signed_webhook(deleted("evt_old_del").as_bytes())).status, 200);
+        assert_eq!(user_subscription(&state, "again@example.com").expect("sub").status, "canceled");
+
+        let checkout = br#"{
+            "id":"evt_again_cs",
+            "type":"checkout.session.completed",
+            "data":{"object":{
+                "customer":"cus_again",
+                "customer_email":"again@example.com",
+                "subscription":"sub_again"
+            }}
+        }"#;
+        assert_eq!(handle(&state, signed_webhook(checkout)).status, 200);
+        assert_eq!(user_subscription(&state, "again@example.com").expect("sub").status, "active");
+
+        let res = handle(&state, signed_webhook(deleted("evt_old_del_retry").as_bytes()));
+        assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+
+        let sub = user_subscription(&state, "again@example.com").expect("sub");
+        assert_eq!(sub.status, "active");
+        assert_eq!(sub.stripe_id, "cus_again");
+        assert_eq!(sub.subscription_id.as_deref(), Some("sub_again"));
+        assert!(is_subscriber(&sub));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn payment_db_error_returns_500_and_is_not_recorded() {
+        let mut mock = crate::stripe::StripeMock::default();
+        mock.subscriptions.insert(
+            "sub_dbfail".into(),
+            r#"{"id":"sub_dbfail","status":"active","current_period_end":1900000000}"#.into(),
+        );
+        let (state, dir) = stripe_state_with_mock(mock);
+        let _ = signed_up(&state, "dbfail@example.com");
+
+        state
+            .pool
+            .with(|db| {
+                db.exec(
+                    "CREATE TRIGGER fail_sub_write BEFORE UPDATE ON Users
+                     BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END",
+                )
+            })
+            .expect("trigger");
+
+        let payload = br#"{
+            "id":"evt_dbfail_cs",
+            "type":"checkout.session.completed",
+            "data":{"object":{
+                "customer":"cus_dbfail",
+                "customer_email":"dbfail@example.com",
+                "subscription":"sub_dbfail"
+            }}
+        }"#;
+        assert_eq!(handle(&state, signed_webhook(payload)).status, 500);
+        assert!(state
+            .pool
+            .find_webhook_event("evt_dbfail_cs")
+            .expect("find")
+            .is_none());
+
+        state
+            .pool
+            .with(|db| db.exec("DROP TRIGGER fail_sub_write"))
+            .expect("drop trigger");
+        assert_eq!(handle(&state, signed_webhook(payload)).status, 200);
+        assert_eq!(user_subscription(&state, "dbfail@example.com").expect("sub").status, "active");
+        assert!(state
+            .pool
+            .find_webhook_event("evt_dbfail_cs")
+            .expect("find")
+            .is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn payment_invoice_paid_and_payment_failed() {
         let mut mock = crate::stripe::StripeMock::default();
         mock.customers
@@ -2031,7 +2243,6 @@ mod tests {
         assert_eq!(sub.status, "active");
         assert_eq!(sub.expires, Some(1_910_000_000));
 
-        // payment_failed only logs when the user exists — still 200.
         let failed = br#"{
             "id":"evt_inv_fail",
             "type":"invoice.payment_failed",
@@ -2046,6 +2257,10 @@ mod tests {
         let mut mock = crate::stripe::StripeMock::default();
         mock.customers
             .insert("cus_idem".into(), "idem@example.com".into());
+        mock.subscriptions.insert(
+            "sub_idem".into(),
+            r#"{"id":"sub_idem","status":"active","current_period_end":1920000000}"#.into(),
+        );
         let (state, dir) = stripe_state_with_mock(mock);
         let _ = signed_up(&state, "idem@example.com");
 
@@ -2053,6 +2268,7 @@ mod tests {
             "id":"evt_idem_1",
             "type":"customer.subscription.updated",
             "data":{"object":{
+                "id":"sub_idem",
                 "customer":"cus_idem",
                 "status":"active",
                 "current_period_end":1920000000
@@ -2060,7 +2276,6 @@ mod tests {
         }"#;
         assert_eq!(handle(&state, signed_webhook(payload)).status, 200);
         assert_eq!(handle(&state, signed_webhook(payload)).status, 200);
-        // Still one row, still active.
         assert!(state
             .pool
             .find_webhook_event("evt_idem_1")
@@ -2145,6 +2360,81 @@ mod tests {
         let res = handle(&state, req);
         assert_eq!(res.status, 403);
         assert_eq!(json_body(&res).get_str("error"), Some("Email mismatch"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn set_subscription_status(state: &AppState, email: &str, status: &str) {
+        let id = state
+            .pool
+            .find_user(&UserQuery::Email(email.into()))
+            .expect("query")
+            .expect("user")
+            .id;
+        let sub = Subscription {
+            stripe_id: "cus_trial_test".into(),
+            expires: Some(config::now_secs() + 86_400),
+            status: status.into(),
+            subscription_id: Some("sub_trial_test".into()),
+        };
+        state
+            .pool
+            .update_user_subscription(&id, &sub)
+            .expect("subscribe");
+    }
+
+    fn usage_check_body(state: &AppState, who: &Response) -> Json {
+        let mut req = Request::for_test("POST", "/api/usage");
+        cookie_header(&mut req, who);
+        req.set_test_body(br#"{"operation":"check"}"#.to_vec());
+        let res = handle(state, req);
+        assert_eq!(res.status, 200, "{}", String::from_utf8_lossy(&res.body));
+        json_body(&res)
+    }
+
+    #[test]
+    fn trialing_counts_as_paid_and_lapsed_statuses_do_not() {
+        let sub = |status: &str, expires: Option<i64>| Subscription {
+            stripe_id: "cus_t".into(),
+            expires,
+            status: status.into(),
+            subscription_id: Some("sub_t".into()),
+        };
+        let later = Some(config::now_secs() + 3600);
+        assert!(is_subscriber(&sub("active", later)));
+        assert!(is_subscriber(&sub("trialing", later)));
+        assert!(is_subscriber(&sub("trialing", None)));
+        assert!(
+            !is_subscriber(&sub("trialing", Some(config::now_secs() - 1))),
+            "an expired trial is not paid"
+        );
+        for status in [
+            "past_due",
+            "canceled",
+            "incomplete",
+            "incomplete_expired",
+            "unpaid",
+            "paused",
+            "",
+        ] {
+            assert!(!is_subscriber(&sub(status, later)), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn usage_reports_a_trialing_user_as_a_subscriber() {
+        let (state, dir) = test_state();
+        let trial = signed_up(&state, "trial-usage@example.com");
+        set_subscription_status(&state, "trial-usage@example.com", "trialing");
+        let body = usage_check_body(&state, &trial);
+        assert_eq!(body.get("isSubscriber"), Some(&Json::Bool(true)));
+        assert_eq!(body.get_i64("remaining"), Some(-1));
+        for status in ["past_due", "canceled", "incomplete"] {
+            let email = format!("{status}-usage@example.com");
+            let who = signed_up(&state, &email);
+            set_subscription_status(&state, &email, status);
+            let body = usage_check_body(&state, &who);
+            assert_eq!(body.get("isSubscriber"), Some(&Json::Bool(false)), "{status}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

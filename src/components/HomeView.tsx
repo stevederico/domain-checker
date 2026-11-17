@@ -1,30 +1,22 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import type { ChangeEvent } from 'react';
 import { toast } from 'sonner';
+import { Button } from '@stevederico/skateboard-ui/ui/button';
 import { Input } from '@stevederico/skateboard-ui/ui/input';
 import { Spinner } from '@stevederico/skateboard-ui/ui/spinner';
 import { Kbd } from '@stevederico/skateboard-ui/ui/kbd';
+import { cn } from '@stevederico/skateboard-ui/lib/utils';
 
 const TLDS = ['com', 'net', 'org', 'io', 'dev', 'app', 'co', 'xyz', 'ai', 'shop', 'site', 'tech'];
 
-/** Single TLD availability result returned by the /check endpoint (or built locally). */
 interface DomainResult {
-  /** Top-level domain (e.g. "com"). */
   tld: string;
-  /** Full domain name (e.g. "example.com"). */
   domain: string;
-  /** Availability — null while loading or on error/unknown. */
   available: boolean | null;
-  /** Status string ("loading", "error", or a backend-provided state). */
   status: string;
-  /** Check method that produced the result ("whois", "rdap", or "dns"). */
   method?: string;
 }
 
-/**
- * Determine backend URL based on environment
- * @returns Base API URL
- */
 function getApiBase(): string {
   if (typeof window !== 'undefined' && window.location.port === '5173') {
     return 'http://localhost:8000/api';
@@ -32,16 +24,6 @@ function getApiBase(): string {
   return '/api';
 }
 
-/**
- * Domain availability checker view
- *
- * Renders a search input with debounced RDAP+DNS lookups across 12 TLDs.
- * Results display as a compact two-column list with green/red dot indicators.
- * Available domains copy to clipboard on click (no external registrar links).
- *
- * @component
- * @returns Domain checker view
- */
 export default function HomeView() {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<DomainResult[]>([]);
@@ -118,7 +100,7 @@ export default function HomeView() {
       <div className="flex flex-1 flex-col items-center">
         <div className="w-full max-w-2xl px-4 py-8 md:py-12">
           <div className="text-center mb-8">
-            <h1 className="text-3xl font-bold tracking-tight mb-2">Find your domain</h1>
+            <h1 className="text-3xl font-bold tracking-tight mb-2 text-balance">Find your domain</h1>
             <p className="text-muted-foreground text-sm">
               Direct WHOIS lookup — your queries are never stored or shared
             </p>
@@ -128,6 +110,7 @@ export default function HomeView() {
             <Input
               ref={inputRef}
               type="text"
+              aria-label="Domain name"
               placeholder="Enter a domain name..."
               value={query}
               onChange={handleInputChange}
@@ -138,7 +121,7 @@ export default function HomeView() {
             />
             <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-1.5 text-muted-foreground">
               {isLoading ? (
-                <Spinner className="h-4 w-4" />
+                <Spinner className="size-4" />
               ) : (
                 <span className="text-xs hidden sm:inline">
                   <Kbd>auto</Kbd>
@@ -150,12 +133,12 @@ export default function HomeView() {
           {hasSearched && !isLoading && results.length > 0 && (
             <div className="flex items-center gap-3 mb-4 text-sm text-muted-foreground">
               {availableCount > 0 && (
-                <span className="text-emerald-500 font-medium">
+                <span className="text-success font-medium">
                   {availableCount} available
                 </span>
               )}
               {takenCount > 0 && (
-                <span className="text-red-500 font-medium">
+                <span className="text-danger font-medium">
                   {takenCount} taken
                 </span>
               )}
@@ -184,35 +167,19 @@ export default function HomeView() {
   );
 }
 
-/**
- * Copy domain name to clipboard and show toast notification
- *
- * @param domain - Domain name to copy
- */
-function copyDomain(domain: string) {
-  navigator.clipboard.writeText(domain).then(() => {
+async function copyDomain(domain: string) {
+  try {
+    await navigator.clipboard.writeText(domain);
     toast.success(`Copied ${domain}`);
-  }).catch(() => {
+  } catch {
     toast.error('Failed to copy');
-  });
+  }
 }
 
-/** Props for {@link DomainRow}. */
 interface DomainRowProps {
-  /** Domain check result to render. */
   result: DomainResult;
 }
 
-/**
- * Single domain result row with colored dot indicator
- *
- * Green dot = WHOIS/RDAP-confirmed available (click to copy).
- * Yellow dot = DNS-inferred likely available (click to copy, less certain).
- * Red dot = taken (muted text). Gray dot = unknown/loading.
- *
- * @component
- * @returns Domain result row
- */
 function DomainRow({ result }: DomainRowProps) {
   const { domain, available, status, method } = result;
   const isLoading = status === 'loading';
@@ -221,7 +188,7 @@ function DomainRow({ result }: DomainRowProps) {
   if (isLoading) {
     return (
       <div className="flex items-center gap-3 py-2.5 px-1 border-b border-border/40">
-        <span className="h-2.5 w-2.5 rounded-full bg-muted-foreground/30 animate-pulse shrink-0" />
+        <span className="size-2.5 rounded-full bg-muted-foreground/30 motion-safe:animate-pulse shrink-0" />
         <span className="text-sm text-muted-foreground/50">{domain}</span>
       </div>
     );
@@ -229,21 +196,24 @@ function DomainRow({ result }: DomainRowProps) {
 
   if (available === true) {
     return (
-      <button
-        onClick={() => copyDomain(domain)}
-        className="flex items-center gap-3 py-2.5 px-1 border-b border-border/40 hover:bg-accent/50 transition-colors cursor-pointer group w-full text-left"
-      >
-        <span className={`h-2.5 w-2.5 rounded-full shrink-0 ${isDNS ? 'bg-yellow-500' : 'bg-emerald-500'}`} />
-        <span className="text-sm font-medium group-hover:underline">{domain}</span>
-        {isDNS && <span className="text-xs text-muted-foreground/50 ml-auto">likely</span>}
-      </button>
+      <div className="border-b border-border/40">
+        <Button
+          variant="ghost"
+          onClick={() => copyDomain(domain)}
+          className="group h-auto w-full justify-start gap-3 rounded-none border-0 px-1 py-2.5 text-left font-normal hover:bg-accent/50 active:scale-100"
+        >
+          <span className={cn('size-2.5 rounded-full shrink-0', isDNS ? 'bg-warning' : 'bg-success')} />
+          <span className="text-sm font-medium group-hover:underline">{domain}</span>
+          {isDNS && <span className="text-xs text-muted-foreground/50 ml-auto">likely</span>}
+        </Button>
+      </div>
     );
   }
 
   if (available === false) {
     return (
       <div className="flex items-center gap-3 py-2.5 px-1 border-b border-border/40">
-        <span className="h-2.5 w-2.5 rounded-full bg-red-500 shrink-0" />
+        <span className="size-2.5 rounded-full bg-danger shrink-0" />
         <span className="text-sm text-muted-foreground">{domain}</span>
       </div>
     );
@@ -251,7 +221,7 @@ function DomainRow({ result }: DomainRowProps) {
 
   return (
     <div className="flex items-center gap-3 py-2.5 px-1 border-b border-border/40">
-      <span className="h-2.5 w-2.5 rounded-full bg-muted-foreground/40 shrink-0" />
+      <span className="size-2.5 rounded-full bg-muted-foreground/40 shrink-0" />
       <span className="text-sm text-muted-foreground/60">{domain}</span>
     </div>
   );

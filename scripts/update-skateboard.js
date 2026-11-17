@@ -1,44 +1,5 @@
 #!/usr/bin/env node
 
-/**
- * Update an app's skateboard boilerplate files to match the latest release.
- *
- * Uses the app's current `skateboardVersion` as a 3-way-merge BASELINE: it clones
- * skateboard (full history), reads the baseline files at the matching git tag, and
- * merges the template's baseline→latest changes onto the app's files with
- * `git merge-file`. This PRESERVES local edits and only surfaces real conflicts as
- * `<<<<<<<` markers — it never blindly overwrites a customized file.
- *
- * package.json is merged the same way: deps the template ADDED are added, deps the
- * template REMOVED are pruned, and template version bumps are applied only where the
- * app hadn't customized them — app-specific deps are left untouched.
- *
- * If the app's `skateboardVersion` has no matching tag (unknown/very old), there is no
- * baseline, so it falls back to the legacy behavior (overwrite-with-confirm for files,
- * add-only for deps) and warns that pruning/merging is unavailable.
- *
- * If any file ends declined, conflicted, or errored, `skateboardVersion` is NOT
- * stamped — a re-run (with `--baseline <old>`) can finish the job after resolving.
- * Passing `--baseline` also forces a re-sync even when `skateboardVersion` already
- * matches the latest release.
- *
- * Shows a diff for each change and requires confirmation before writing. Re-runnable;
- * safe to abort at any prompt.
- *
- * Template renames (e.g. the 3.8.0 JS→TS conversion) are handled via the RENAMES
- * map: the app's old-named file is 3-way merged against the old path at the
- * baseline tag and the new path at HEAD, written under the new name, and the old
- * file removed — so local edits survive the rename.
- *
- * Usage:
- *   node scripts/update-skateboard.js                   # interactive
- *   node scripts/update-skateboard.js --yes             # apply all without prompts
- *   node scripts/update-skateboard.js --baseline 3.7.0  # force the merge baseline
- *     (use when skateboardVersion was stamped without the files actually migrating)
- *
- * Env overrides (for testing): SKATEBOARD_REPO (clone URL/path), SKATEBOARD_BRANCH.
- */
-
 import { execSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, chmodSync, readdirSync, lstatSync, readlinkSync, symlinkSync, unlinkSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -47,13 +8,29 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 
 const APP_ROOT = process.cwd();
-// Per-process clone dir so concurrent fleet runs don't clobber each other's checkout.
 const TMP_DIR = join(tmpdir(), `skateboard-update-${process.pid}`);
 const REPO = process.env.SKATEBOARD_REPO || 'https://github.com/stevederico/skateboard.git';
 const BRANCH = process.env.SKATEBOARD_BRANCH || '';
 
-// Template-owned files (current names at HEAD). App-owned files (constants.json,
-// components, config.json, .env, main.jsx) are never touched — see SKIP_NOTE.
+const GUARDRAIL_RULES = [
+  'ban-ts-comment', 'clickable-element-needs-keyboard', 'compound-component-structure',
+  'filename-convention', 'handler-naming', 'heading-text-wrap', 'icon-button-requires-label',
+  'icon-requires-size', 'icons-through-funnel', 'img-requires-alt', 'import-order',
+  'input-requires-label', 'layer-boundaries', 'motion-safe-animations',
+  'no-arbitrary-spacing-radius', 'no-aria-hidden-on-focusable', 'no-banned-build-tooling',
+  'no-browser-dialogs', 'no-class-components', 'no-classname-template-ternary',
+  'no-dark-variant', 'no-database-drivers', 'no-deep-package-imports', 'no-direct-react-router',
+  'no-dotenv', 'no-emoji-icons', 'no-empty-catch', 'no-eslint-or-playwright', 'no-explicit-any', 'no-fetch-in-effect',
+  'no-focused-or-skipped-tests', 'no-foreign-test-frameworks', 'no-globals-package',
+  'no-hardcoded-connection-strings', 'no-inline-svg', 'no-loading-text-in-button',
+  'no-loose-types', 'no-non-null-assertion', 'no-other-icon-libraries',
+  'no-outline-none-without-focus-ring', 'no-promise-then', 'no-raw-color-classes',
+  'no-raw-form-elements', 'no-removed-skateboard-ui-imports', 'no-require',
+  'no-space-utilities', 'no-third-party-http-clients', 'no-transition-all',
+  'no-type-assertion', 'no-unknown-classes', 'prefer-size-utility',
+  'suspense-skeleton-fallback', 'test-file-naming', 'use-list-data-states'
+];
+
 const ALLOWLIST = [
   'backend/Cargo.toml',
   'backend/Cargo.lock',
@@ -66,6 +43,7 @@ const ALLOWLIST = [
   'backend/src/config.rs',
   'backend/src/crypto.rs',
   'backend/src/db.rs',
+  'backend/src/hrana.rs',
   'backend/src/http.rs',
   'backend/src/json.rs',
   'backend/src/kdf.rs',
@@ -93,19 +71,36 @@ const ALLOWLIST = [
   'scripts/verify-ui-version.test.js',
   'scripts/version-consistency.test.js',
   'scripts/test-docs.mjs',
-  'SECURITY.md'
+  'SECURITY.md',
+  '.oxlintrc.json',
+  '.dependency-cruiser.js',
+  'guardrails/verify/paths.js',
+  'guardrails/verify/browser.js',
+  'guardrails/verify/servers.js',
+  'guardrails/verify/verify.e2e.js',
+  'guardrails/package.json',
+  'guardrails/package-lock.json',
+  'guardrails/eslint-plugin/index.js',
+  'guardrails/eslint-plugin/index.test.js',
+  'guardrails/eslint-plugin/layers.js',
+  'guardrails/eslint-plugin/lib/bannedImports.js',
+  'guardrails/eslint-plugin/lib/classStrings.js',
+  'guardrails/eslint-plugin/lib/jsx.js',
+  'guardrails/eslint-plugin/lib/moduleSources.js',
+  'guardrails/eslint-plugin/lib/paths.js',
+  'guardrails/eslint-plugin/lib/ruleTester.js',
+  ...GUARDRAIL_RULES.flatMap((rule) => [
+    `guardrails/eslint-plugin/rules/${rule}.js`,
+    `guardrails/eslint-plugin/rules/${rule}.test.js`
+  ])
 ];
 
-// Template-owned symlinks: link path → target path (both relative to app root).
 // CLAUDE.md is a symlink to AGENTS.md (the open-standard source of truth). It is NOT
 // on the ALLOWLIST because `git show HEAD:CLAUDE.md` serves the symlink's TARGET STRING
 // ("AGENTS.md"), not file content — syncing it as a regular file would overwrite the
 // app's CLAUDE.md with the 9-byte string "AGENTS.md". ensureSymlink recreates the link.
 const SYMLINKS = { 'CLAUDE.md': 'AGENTS.md' };
 
-// Files the template deleted that apps should drop too. A stale copy is harmful
-// (ambient declarations shadow the real types: backend/ambient.d.ts hid pg/mongodb
-// driver types; src/skateboard-ui.d.ts would hide skateboard-ui's own .d.ts ≥3.10.0).
 const REMOVED = [
   'backend/ambient.d.ts',
   'src/skateboard-ui.d.ts',
@@ -148,16 +143,15 @@ const REMOVED = [
   'backend/lib/validation.js',
   'backend/lib/validation.test.js',
   'backend/vendor/legacy-bcrypt.js',
-  'backend/vendor/legacy-bcrypt.d.ts'
+  'backend/vendor/legacy-bcrypt.d.ts',
+  'eslint.config.js',
+  'guardrails/verify/playwright.config.js',
+  'guardrails/eslint-plugin/rules/require-jsdoc-on-exports.js',
+  'guardrails/eslint-plugin/rules/require-jsdoc-on-exports.test.js'
 ];
 
-// Template renames: new path at HEAD → old path apps may still have. Apps with the
-// old-named file get a 3-way merge across the rename (see migrateRenamedFile).
 const RENAMES = {
   'vite.config.ts': 'vite.config.js',
-  // The instruction file flipped from CLAUDE.md (real file) to AGENTS.md (real file)
-  // + CLAUDE.md symlink. An app whose CLAUDE.md is still a regular file gets its edits
-  // 3-way merged into AGENTS.md; SYMLINKS then recreates CLAUDE.md as the symlink.
   'AGENTS.md': 'CLAUDE.md'
 };
 
@@ -166,6 +160,7 @@ Files NOT updated (app-owned — port manually if needed):
   - src/constants.json
   - src/main.jsx           (your routes — stays .jsx; Vite handles mixed JS/TS)
   - src/components/*       (your components)
+  - src/icons.ts           (your icon funnel; create it if npm run lint asks)
   - src/assets/styles.css  (your theme overrides)
   - backend/config.json
   - backend/.env*
@@ -178,7 +173,6 @@ const baselineArg = (() => {
   return i !== -1 ? process.argv[i + 1] : null;
 })();
 
-/** Full clone (not shallow) so baseline version tags are available for 3-way merge. */
 function fetchSkateboard() {
   if (existsSync(TMP_DIR)) rmSync(TMP_DIR, { recursive: true, force: true });
   console.log('Fetching skateboard (full history for 3-way merge)...');
@@ -190,7 +184,7 @@ function readJSON(path) {
 }
 
 function writeJSON(path, data) {
-  writeFileSync(path, JSON.stringify(data, null, 2) + '\n');
+  writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
 }
 
 async function confirm(prompt) {
@@ -201,7 +195,6 @@ async function confirm(prompt) {
   return ans.trim().toLowerCase().startsWith('y');
 }
 
-/** True if `version` exists as a git tag in the cloned template. */
 function resolveBaselineTag(version) {
   if (!version || version === 'unknown') return null;
   try {
@@ -213,7 +206,6 @@ function resolveBaselineTag(version) {
   }
 }
 
-/** Contents of a file at a git ref in the cloned template, or null if absent there. */
 function showAtRef(ref, relPath) {
   try {
     return execSync(`git -C ${TMP_DIR} show ${ref}:${relPath}`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
@@ -222,7 +214,6 @@ function showAtRef(ref, relPath) {
   }
 }
 
-/** Print a unified diff between two strings (current → incoming), truncated. */
 function showDiff(curContent, incomingContent, label) {
   const a = join(tmpdir(), 'sk-cur.tmp');
   const b = join(tmpdir(), 'sk-inc.tmp');
@@ -230,34 +221,20 @@ function showDiff(curContent, incomingContent, label) {
   writeFileSync(b, incomingContent);
   try {
     execSync(`diff -u "${a}" "${b}" | head -60`, { stdio: 'inherit' });
-  } catch {
-    // diff exits 1 when files differ — expected
+  } catch (err) {
+    if (err?.status !== 1) console.error(`[warn] could not show diff for ${label}: ${err?.message ?? err}`);
   }
   rmSync(a, { force: true });
   rmSync(b, { force: true });
 }
 
-/**
- * Write a synced template file into the app, creating parent dirs as needed.
- * Files under `.githooks/` are chmod'd 0o755 — `writeFileSync` alone leaves them
- * non-executable and git silently skips non-executable hooks.
- */
 function writeSynced(dst, relPath, content) {
   mkdirSync(dirname(dst), { recursive: true });
   writeFileSync(dst, content);
   if (relPath.startsWith('.githooks/')) chmodSync(dst, 0o755);
 }
 
-/**
- * 3-way merge baseContent→newContent onto appContent via `git merge-file`.
- *
- * @returns {{ merged: string, conflicts: number }} `conflicts` is the conflict count,
- *   or -1 on a hard failure (exit 255 or empty output for a non-empty input — binary/NUL
- *   or unmergeable content). On -1, `merged` echoes `appContent` and callers MUST leave
- *   the app's file untouched — writing the empty merge output would destroy it.
- */
 function threeWayMerge(appContent, baseContent, newContent) {
-  // PID-scoped so concurrent fleet runs don't overwrite each other's merge temp files.
   const cur = join(tmpdir(), `sk-mf-cur.${process.pid}.tmp`);
   const base = join(tmpdir(), `sk-mf-base.${process.pid}.tmp`);
   const other = join(tmpdir(), `sk-mf-new.${process.pid}.tmp`);
@@ -284,20 +261,6 @@ function threeWayMerge(appContent, baseContent, newContent) {
   return { merged, conflicts };
 }
 
-/**
- * Scan 3-way-merge output for defects that compile clean and ship silently:
- *   1. Residual conflict markers INSIDE block comments — `tsc` ignores `<<<<<<<`
- *      in a `/** ... *␐/` so `npm run typecheck` passes with the markers still there.
- *   2. Duplicate top-level declarations — when a function/const is absent from the
- *      (too-old) baseline but added on BOTH sides at different positions, the merge
- *      keeps both copies with NO conflict marker (later caught only as TS2393).
- * Returns an array of human-readable issue strings (empty = clean). Duplicate
- * detection runs only on JS/TS sources; marker detection on any text file.
- *
- * @param {string} content merged file content
- * @param {string} relPath path (selects whether duplicate detection applies)
- * @returns {string[]}
- */
 function findMergeDefects(content, relPath) {
   const issues = [];
   const lines = content.split('\n');
@@ -321,13 +284,6 @@ function findMergeDefects(content, relPath) {
   return issues;
 }
 
-/**
- * Sync one template file into the app (3-way merge, add, or overwrite fallback).
- *
- * @returns {Promise<'ok'|'wrote'|'declined'|'conflicts'|'error'>} 'ok' = nothing to do,
- *   'wrote' = written cleanly, 'declined' = user kept their file, 'conflicts' = written
- *   with <<<<<<< markers, 'error' = merge failed hard and the file was left untouched.
- */
 async function syncFile(relPath, baselineTag) {
   const dst = join(APP_ROOT, relPath);
   const newContent = showAtRef('HEAD', relPath);
@@ -340,7 +296,6 @@ async function syncFile(relPath, baselineTag) {
   const oldRel = RENAMES[relPath];
   const dstExists = existsSync(dst);
 
-  // App still has the pre-rename file and not the new one → migrate across the rename.
   if (!dstExists && oldRel && existsSync(join(APP_ROOT, oldRel))) {
     return migrateRenamedFile(relPath, oldRel, baselineTag, newContent);
   }
@@ -352,7 +307,6 @@ async function syncFile(relPath, baselineTag) {
     return 'ok';
   }
 
-  // App doesn't have this file yet → offer to add it verbatim.
   if (!dstExists) {
     console.log(`\n[new]  ${relPath} — not present in app`);
     if (await confirm(`Add ${relPath}?`)) {
@@ -364,12 +318,10 @@ async function syncFile(relPath, baselineTag) {
     return 'declined';
   }
 
-  // Baseline lookup falls back to the pre-rename path for baselines older than the rename.
   const baseContent = baselineTag
     ? (showAtRef(baselineTag, relPath) ?? (oldRel ? showAtRef(baselineTag, oldRel) : null))
     : null;
 
-  // No baseline → can't merge; legacy overwrite-with-confirm (and warn).
   if (baseContent === null) {
     console.log(`\n[diff] ${relPath}  (no baseline — full overwrite; your edits would be replaced)`);
     showDiff(appContent, newContent, relPath);
@@ -389,7 +341,6 @@ async function syncFile(relPath, baselineTag) {
 
   const { merged, conflicts } = threeWayMerge(appContent, baseContent, newContent);
 
-  // Hard merge failure — do NOT write or delete anything.
   if (conflicts === -1) {
     console.log(`[error] ${relPath} — git merge-file failed (binary or unmergeable content); file left untouched`);
     return 'error';
@@ -400,8 +351,6 @@ async function syncFile(relPath, baselineTag) {
     return 'ok';
   }
 
-  // A clean (conflicts === 0) merge can still ship a duplicate declaration with no
-  // marker, so always scan the output — not just when git reported a conflict.
   const defects = findMergeDefects(merged, relPath);
 
   console.log(`\n[merge] ${relPath}${conflicts ? ` — ${conflicts} CONFLICT(S)` : ''}${defects.length ? ` — ${defects.length} DEFECT(S)` : ''}`);
@@ -427,22 +376,12 @@ async function syncFile(relPath, baselineTag) {
   return 'declined';
 }
 
-/**
- * Migrate a template-renamed file (e.g. backend/server.js → backend/server.ts):
- * 3-way merge the app's old-named file (current) against the old path at the
- * baseline tag (base) and the new path at HEAD (new) — `git merge-file` is
- * content-based, so names don't matter and local edits survive the rename.
- * Writes the result under the new name and removes the old file on confirm.
- *
- * @returns {Promise<'ok'|'wrote'|'declined'|'conflicts'|'error'>} same statuses as syncFile.
- */
 async function migrateRenamedFile(relPath, oldRel, baselineTag, newContent) {
   const dst = join(APP_ROOT, relPath);
   const oldDst = join(APP_ROOT, oldRel);
   const appContent = readFileSync(oldDst, 'utf8');
   const baseContent = baselineTag ? showAtRef(baselineTag, oldRel) : null;
 
-  // No baseline → can't merge; overwrite-with-confirm (and warn), like syncFile.
   if (baseContent === null) {
     console.log(`\n[rename] ${oldRel} → ${relPath}  (no baseline — full overwrite; your edits would be replaced)`);
     showDiff(appContent, newContent, relPath);
@@ -458,7 +397,6 @@ async function migrateRenamedFile(relPath, oldRel, baselineTag, newContent) {
 
   const { merged, conflicts } = threeWayMerge(appContent, baseContent, newContent);
 
-  // Hard merge failure — do NOT write the new file or delete the old one.
   if (conflicts === -1) {
     console.log(`[error] ${oldRel} — git merge-file failed (binary or unmergeable content); file left untouched`);
     return 'error';
@@ -485,30 +423,13 @@ async function migrateRenamedFile(relPath, oldRel, baselineTag, newContent) {
   return 'declined';
 }
 
-/**
- * Ensure `linkRel` is a symlink pointing at `targetRel` (both relative to the app root).
- *
- * Recreates the template's `CLAUDE.md → AGENTS.md` symlink. Unlike ALLOWLIST files this
- * is NOT copied via `git show` (which would yield the 9-byte target string, not content)
- * — it is materialized with `symlinkSync` so the app gets a real symlink.
- *
- * - link absent            → create it
- * - link already correct   → no-op
- * - link wrong target      → retarget
- * - link is a regular file → offer to replace (legacy real CLAUDE.md; its content should
- *                            already have migrated into AGENTS.md via RENAMES)
- * - target missing         → skip (nothing to point at)
- *
- * @returns {Promise<'ok'|'wrote'|'declined'|'error'>}
- */
 async function ensureSymlink(linkRel, targetRel, { root = APP_ROOT, confirmFn = confirm } = {}) {
   const linkPath = join(root, linkRel);
   if (!existsSync(join(root, targetRel))) {
     console.log(`[skip] ${linkRel} symlink — target ${targetRel} not present`);
     return 'ok';
   }
-  let stat = null;
-  try { stat = lstatSync(linkPath); } catch { /* absent */ }
+  const stat = lstatSync(linkPath, { throwIfNoEntry: false });
 
   if (stat?.isSymbolicLink()) {
     if (readlinkSync(linkPath) === targetRel) {
@@ -542,11 +463,6 @@ async function ensureSymlink(linkRel, targetRel, { root = APP_ROOT, confirmFn = 
   return 'wrote';
 }
 
-/**
- * Merge the template's package.json deps/scripts into the app's (add/prune/update via
- * the baseline). Stamps `skateboardVersion` only when `stamp` is true — callers pass
- * false when any file ended declined/conflicted/errored so a re-run can finish the job.
- */
 async function mergePackageJson(baselineTag, stamp = true) {
   const newPkg = JSON.parse(showAtRef('HEAD', 'package.json'));
   const appPkg = readJSON(join(APP_ROOT, 'package.json'));
@@ -559,16 +475,13 @@ async function mergePackageJson(baselineTag, stamp = true) {
     const appD = appPkg[key] || {};
     const newD = newPkg[key] || {};
     const baseD = basePkg?.[key] || {};
-    // Template added a dep → add if the app doesn't already declare it.
     for (const [name, version] of Object.entries(newD)) {
       if (!(name in appD)) adds[`${key}.${name}`] = version;
     }
     if (basePkg) {
-      // Template removed a dep → prune from app (only deps the template once shipped).
       for (const name of Object.keys(baseD)) {
         if (!(name in newD) && name in appD) removes[`${key}.${name}`] = appD[name];
       }
-      // Template bumped a version → apply only if the app hadn't customized it.
       for (const [name, version] of Object.entries(newD)) {
         if (name in appD && name in baseD && appD[name] === baseD[name] && appD[name] !== version) {
           updates[`${key}.${name}`] = `${appD[name]} → ${version}`;
@@ -577,8 +490,6 @@ async function mergePackageJson(baselineTag, stamp = true) {
     }
   }
 
-  // Scripts: add template-added scripts; update template-changed scripts the app
-  // hasn't customized (e.g. root `server` start → dev). Never pruned — apps add their own.
   {
     const appS = appPkg.scripts || {}, newS = newPkg.scripts || {}, baseS = basePkg?.scripts || {};
     for (const [name, cmd] of Object.entries(newS)) {
@@ -606,8 +517,6 @@ async function mergePackageJson(baselineTag, stamp = true) {
   for (const [k, v] of Object.entries(updates)) console.log(`  ~ ${k}: ${v}`);
   if (!basePkg) console.log(`  ⚠ no baseline tag for ${appPkg.skateboardVersion} — add-only; cannot prune removed deps or detect customized versions.`);
 
-  // The postinstall hooksPath script points git away from .git/hooks — warn if the
-  // app already has real (non-sample) hooks there that would silently stop running.
   if (String(adds['scripts.postinstall'] ?? '').includes('hooksPath')) {
     const hooksDir = join(APP_ROOT, '.git', 'hooks');
     const existingHooks = existsSync(hooksDir)
@@ -647,8 +556,6 @@ async function mergePackageJson(baselineTag, stamp = true) {
     }
   }
   if (stamp) appPkg.skateboardVersion = newPkg.version;
-  // Template dropped the Node backend workspace; leave a stale `workspaces`
-  // entry pointing at a deleted backend/package.json and `npm install` dies.
   if (basePkg && !newPkg.workspaces && appPkg.workspaces) {
     delete appPkg.workspaces;
   }
@@ -671,12 +578,9 @@ async function main() {
   console.log(`\nApp skateboardVersion: ${currentVersion}`);
   console.log(`Latest skateboard:     ${newPkg.version}`);
 
-  // Stranded state: an older updater stamped skateboardVersion without migrating
-  // renamed files (its allowlist predated the renames). Detect and keep going.
   const stranded = Object.entries(RENAMES).filter(([newRel, oldRel]) =>
     existsSync(join(APP_ROOT, oldRel)) && !existsSync(join(APP_ROOT, newRel)));
 
-  // --baseline is an explicit request to re-sync, so it skips the up-to-date early-exit.
   if (currentVersion === newPkg.version && !stranded.length && !baselineArg) {
     console.log('\nAlready on latest. Nothing to do.');
     rmSync(TMP_DIR, { recursive: true, force: true });
@@ -704,8 +608,6 @@ async function main() {
     statuses.push(await syncFile(relPath, baselineTag));
   }
 
-  // Drop files the template deleted — keeping them is harmful (stale ambient
-  // declarations shadow real driver types).
   for (const relPath of REMOVED) {
     const dst = join(APP_ROOT, relPath);
     if (!existsSync(dst)) continue;
@@ -720,14 +622,10 @@ async function main() {
     }
   }
 
-  // Recreate template-owned symlinks (CLAUDE.md → AGENTS.md). Runs after the ALLOWLIST
-  // loop so AGENTS.md exists and any legacy real CLAUDE.md has already migrated via RENAMES.
   for (const [linkRel, targetRel] of Object.entries(SYMLINKS)) {
     statuses.push(await ensureSymlink(linkRel, targetRel));
   }
 
-  // Any declined/conflicted/errored file means the upgrade is incomplete — don't stamp
-  // skateboardVersion (the dep/script merges are still offered above).
   const blocked = statuses.filter(s => s === 'declined' || s === 'conflicts' || s === 'error').length;
   await mergePackageJson(baselineTag, blocked === 0);
   if (blocked) {
@@ -735,8 +633,6 @@ async function main() {
     console.log(`  skateboardVersion left at ${currentVersion}. Resolve the flagged files, then re-run with --baseline ${currentVersion}.`);
     console.log(`  NOTE: markers inside JSDoc and duplicate functions COMPILE CLEAN — do not trust 'npm run typecheck' alone;`);
     console.log(`  confirm with: git grep -nE '^(<<<<<<<|=======|>>>>>>>)' -- '*.ts' '*.tsx'`);
-    // Non-zero exit so CI / automation that runs this with --yes does not mistake a
-    // marker-laden or duplicate-ridden result for success.
     process.exitCode = 1;
   }
 
@@ -746,8 +642,8 @@ async function main() {
   console.log('  1. npm install');
   console.log('  2. npm run typecheck — your custom code merged into .ts files may need annotations');
   console.log('  3. See docs/UPGRADE.md for the agent prompt that automates conflict + type fixes.');
+  console.log('  4. npm run guardrails:install && npm run lint (oxlint, a global CLI: mise use -g npm:oxlint) — each message names the fix (e.g. re-export icons from @stevederico/skateboard-ui/icons in src/icons.ts; lucide-react is no longer a dependency; router imports come from @stevederico/skateboard-ui/router, so remove react-router)');
 
-  // tsc already installed → offer to run the typecheck right here.
   if (existsSync(join(APP_ROOT, 'node_modules', '.bin', 'tsc'))) {
     console.log('\ntsc is installed. Note: typecheck is EXPECTED to fail until your custom code is annotated — the errors are the to-do list, not a regression.');
     if (await confirm('Run npm run typecheck now?')) {
@@ -761,7 +657,6 @@ async function main() {
   }
 }
 
-/** True when this file is the process entry point (not imported by a test). */
 const isMain = (() => {
   try { return !!process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url); }
   catch { return false; }

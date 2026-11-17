@@ -48,3 +48,6 @@ SKATEBOARD_UI_EXTENSIONS_PROPOSAL.md
 coverage
 bun.lock
 backend/target
+
+# Runtime verification output (npm run verify): screenshots, agent-browser config, throwaway backend state
+verify-artifacts/

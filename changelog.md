@@ -1,5 +1,22 @@
 ## CHANGELOG
 
+5.14.0
+
+  Skateboard 5.23.0
+  Merge backend fixes
+  Add libSQL client
+  Add oxlint guardrails
+  Add dependency-cruiser
+  Add agent-browser verify
+  Add icon funnel
+  Add status tokens
+  Use Button rows
+  Mount sonner Toaster
+  Label domain input
+  Bump React 19.3.1
+  Bump Vite 8.3.7
+  Update upgrade doc
+
 5.13.0
 
   Bump skateboard-ui 5.19.0

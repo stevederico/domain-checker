@@ -7,6 +7,190 @@ Two ways to bring an existing app up to the latest skateboard template:
 
 **4.x → 5.0 is a breaking major.** Follow the full checklist in [`AGENTS.md` → Migrating 4.x → 5.0](../AGENTS.md#migrating-4x-50-exact-checklist) (icons, DynamicIcon, Vite/SWC, ui pin `5.0.0`, Rust backend). Do not only run the updater.
 
+**5.23.0 — oxlint replaces ESLint, agent-browser replaces Playwright, no JSDoc rule.**
+No runtime change. Install the two global CLIs once per machine:
+`mise use -g npm:oxlint npm:agent-browser` (or `npm install -g oxlint agent-browser`);
+they are not project dependencies. The updater syncs `.oxlintrc.json` (loads
+`guardrails/eslint-plugin` through `jsPlugins`; base rules on every linted file,
+app rules on `src/` only), the new `guardrails/verify/browser.js` and
+`servers.js`, and a `guardrails/package.json` that keeps only dependency-cruiser
+and TypeScript 5. It offers to delete `eslint.config.js`,
+`guardrails/verify/playwright.config.js` and the `require-jsdoc-on-exports` rule:
+code carries no comments now, doc comments included (existing JSDoc goes when its
+code is edited). Accept the `lint` and `verify` script updates, re-run
+`npm run guardrails:install`, then `npm run lint`, `npm run test:guardrails` and
+`npm run verify`. Port custom rule overrides from `eslint.config.js` into
+`.oxlintrc.json` `overrides`, and `// eslint-disable-next-line` comments keep
+working (oxlint honors them; `oxlint-disable-next-line` is the new spelling).
+If you merged your own flows into `verify.e2e.js`, rewrite them with the helpers
+in `guardrails/verify/browser.js` (`findRole`, `click`, `fill`, `expectText`,
+`expectUrl`), which read agent-browser's accessibility snapshot by role and name.
+Remove `verify-artifacts/playwright` if present. The workflows are not synced:
+copy `.github/workflows/ci.yml` (job `guardrails`) and `verify.yml`, which install
+pinned `oxlint` and `agent-browser` globally.
+
+**5.20.0 — skateboard-ui 5.18.0, plain CSS, no Tailwind.** skateboard-ui 5.18.0
+ships plain CSS for its own components and theme, and the app owns plain CSS for
+the classes its `src/` uses. Apps: `npm install @stevederico/skateboard-ui@5.18.0 --save-exact`,
+then write `src/assets/styles.css` once with skateboard-ui's
+`scripts/tailwind-to-css.js` (it runs Tailwind from a temporary install outside
+the app, never a dependency; see the script header):
+`node <skateboard-ui>/scripts/tailwind-to-css.js --tailwind <tmp> --input src/assets/styles.css --scan src --scan index.html --subtract node_modules/@stevederico/skateboard-ui/styles.css --app --out src/assets/styles.css`.
+It keeps the skateboard-ui import, turns `@theme` values into `:root` variables,
+compiles `@apply`, and repeats the few shell rules whose precedence an app class
+depends on. Then `npm uninstall tailwindcss @tailwindcss/vite`, remove
+`tailwindcss()` from `vite.config.ts`, and commit `package.json` with
+`package-lock.json`. Compare light and dark screenshots before and after. The
+updater syncs `no-unknown-classes` (every className must exist in one of the two
+CSS files) and `no-banned-build-tooling` (now bans Tailwind).
+
+**5.19.0 — skateboard-ui 5.17.0, no `shadcn` paths.** skateboard-ui 5.17.0
+removed the `./shadcn/*` exports. Apps: `npm install @stevederico/skateboard-ui@5.17.0 --save-exact`,
+then rewrite `@stevederico/skateboard-ui/shadcn/ui/X` to `/ui/X`,
+`/shadcn/lib/utils` to `/lib/utils` and `/shadcn/hooks/X` to `/hooks/X` (same
+exports). `grep -rn "skateboard-ui/shadcn" src` must print nothing; the
+`no-removed-skateboard-ui-imports` lint rule reports any leftover with its new
+path.
+
+**5.18.0 — skateboard-ui 5.16.0, router from skateboard-ui, no @types/node.**
+skateboard-ui 5.16.0 vendors react-router 7.18.5 and exports it as
+`@stevederico/skateboard-ui/router` (and `/router/dom`), so it is no longer a
+peer. Apps: `npm install @stevederico/skateboard-ui@5.16.0 --save-exact` (if npm
+says `notarget` right after a release, add `--prefer-online`), change every
+`from 'react-router'` / `'react-router-dom'` to
+`from '@stevederico/skateboard-ui/router'` (`react-router/dom` →
+`@stevederico/skateboard-ui/router/dom`; same names, same API), then
+`npm uninstall react-router` and drop `'react-router'` from `vite.config.ts`
+`resolve.dedupe` and `optimizeDeps.include`. `grep -rnE "from ['\"]react-router(-dom)?(/[^'\"]*)?['\"]" src`
+must print nothing: a leftover import loads a second router the shell cannot
+see. The template also drops `@types/node`: `tsconfig.json` now includes only
+`src` and `types` is `["vite/client"]`; keep `@types/node` only if your `src/`
+uses Node types. Commit `package.json` with `package-lock.json`. The updater
+syncs the `no-direct-react-router` lint rule, whose message names the new
+import path.
+
+**5.17.0 — skateboard-ui 5.15.0, no lucide-react.** skateboard-ui 5.12.0
+made `react-router` a peer (and added a `tailwindcss` peer), 5.13.0 vendored
+the Lucide icons and dropped its `lucide-react` dependency, and 5.13.1 added the
+`@stevederico/skateboard-ui/icons` entry. Apps: install the ui pin and an exact
+`react-router` from the reference `package.json`, change the source of every
+`export { ... }` in `src/icons.ts` from `'lucide-react'` to
+`'@stevederico/skateboard-ui/icons'`, move any other `lucide-react` import into
+the funnel, then remove `lucide-react` (`npm uninstall lucide-react`) and commit
+`package.json` with `package-lock.json`. An icon the package does not export
+fails `npm run typecheck`; add it as a local SVG component in the funnel. Re-run
+`npm run guardrails:install && npm run lint` after the updater syncs
+`guardrails/`: the funnel rule now reports any `lucide-react` import.
+
+**5.16.0 — boundary analyzer + runtime verify.** No runtime change. The
+updater now syncs `.dependency-cruiser.js` and `guardrails/verify/`, the nested
+`guardrails/package.json` gains dependency-cruiser and `@playwright/test`
+(re-run `npm run guardrails:install`), and two scripts are added. `npm run
+depcruise` checks the whole import graph against the same layer table as the
+lint rule, plus cycles, orphans, dev-only and undeclared packages; each message
+names the fix. `npm run verify` boots the Vite frontend and the Rust backend
+and clicks through the app in Chromium (first run:
+`cd guardrails && npx --no-install playwright install chromium`); its flows
+assert the template's views and `src/constants.json` names, so merge
+`guardrails/verify/verify.e2e.js` with your app's own pages. Add
+`verify-artifacts/` to `.gitignore` if the updater did not. The workflows
+(`.github/workflows/ci.yml` job `guardrails`, `verify.yml`) are not synced;
+copy them from the reference repo.
+
+**5.15.0 — guardrails lint + icon funnel.** No runtime change. The
+updater now syncs `eslint.config.js` and `guardrails/` (a local ESLint plugin
+whose rules mirror AGENTS.md; ESLint and its TypeScript parser live in the
+nested `guardrails/package.json`, never in root deps) and adds the
+`guardrails:install`, `lint` and `test:guardrails` scripts. Run
+`npm run guardrails:install && npm run lint` and follow each message. The one
+most apps hit: `lucide-react` may only be imported by `src/icons.ts` (app-owned,
+so create it): list the icons the app uses as
+`export { Plus, Trash2 } from 'lucide-react';` and change component imports to
+`import { Plus } from '../icons'`. Lint is not part of `npm run test`.
+
+**5.14.4 — base images pinned by digest.** No runtime change: the
+`Dockerfile` pins node, rust and debian by multi-arch digest (each at least
+7 days old) and sets `ENV RUSTUP_TOOLCHAIN=1.99.1`. Apps can copy the `FROM`
+lines and the toolchain line.
+
+**5.14.3 — skateboard-ui 5.11.4.** `isSubscriber()` now reads
+`POST /usage` `{"operation":"check"}` (the template backend has no
+`GET /isSubscriber` route, so it always returned false). Apps only bump the pin.
+
+**5.14.2 — CI actions on v5.** No runtime change: `.github/workflows/ci.yml`
+pins `actions/checkout` v5.1.0 and `actions/setup-node` v5.0.0 (Node 24
+runtime) by commit SHA. Apps with a copy of this workflow can make the same
+edits.
+
+**5.14.1 — CI hardening.** No runtime change: `.github/workflows/ci.yml` pins
+every action to a commit SHA, sets `permissions: contents: read` and checks out
+with `persist-credentials: false`. Apps with a copy of this workflow can make
+the same edits.
+
+**5.14.0 — trialing counts as paid on the backend.** `is_subscriber` in
+`backend/src/routes.rs` now accepts `PAID_STATUSES = ["active", "trialing"]`
+(the period-end check is unchanged), so `/api/usage` treats a Stripe trial as
+unlimited, matching skateboard-ui's `isPaidStatus` from 5.13.1. Before this, a
+trial user saw the paid UI but hit the free-tier 429. Apps with their own
+`is_subscriber` copy should make the same one-line change.
+
+**5.13.2 — skateboard-ui 5.11.3.** No runtime change: skateboard-ui's
+publish workflow pins its actions and npm, and its harness adds nested submenu
+and closed-menu Escape tests. Apps only bump the pin.
+
+**5.13.1 — skateboard-ui 5.11.2.** A `trialing` subscription counts as paid
+(new `isPaidStatus(status)` export), so trial users no longer see the upgrade
+sheet or show as Free; DropdownMenu closes on an Escape pressed right after
+opening; skateboard-ui's `styles.css` scans only its own `dist` for Tailwind
+classes.
+
+**5.13.0 — skateboard-ui 5.11.0.** Tab bar items, the theme toggle and
+Settings Sign Out have 44px tap targets; Sheet content scrolls on touch and
+Sheet takes an optional `onUserClose`; the auth overlay opens on Sign Up
+unless this device signed in before; Sign Up shows the server's error message
+and suggests a fix for a mistyped mail domain. Sign Up also asks
+`GET /signup/options` for an optional Cloudflare Turnstile site key; the
+template backend has no such route, so the 404 is ignored and no widget shows.
+
+**5.12.0 — Stripe webhook fixes, upgrade promptly.** `customer.subscription.*`
+events re-fetch the subscription from Stripe instead of trusting the event
+snapshot, so a late `created` (status `incomplete`) no longer re-locks a user
+who just paid. A new `Users.subscription_id` column (added automatically on
+startup) records the current subscription, and an event for another,
+non-paying subscription (an old plan's `deleted`) is ignored instead of
+re-locking a user who resubscribed. A database error while applying an event
+now answers 500 without marking the event processed, so Stripe retries it.
+Apps that changed `process_webhook` or `apply_sub_patch` must merge by hand;
+code that builds a `Subscription` needs the new `subscription_id` field.
+
+**5.10.0 — libSQL startup retry.** With `LIBSQL_URL` set, startup keeps
+retrying the shared server for up to 3 minutes (1s doubling to 15s) instead of
+exiting on the first failure. When a whole project restarts at once, the
+database's private hostname can resolve late, and exiting used up the restart
+policy and left the app down.
+
+**5.9.0 — CSRF survives restarts.** CSRF tokens are now
+`<issued ms>.<HMAC>` signed with `JWT_SECRET` instead of kept in an in-memory
+store, so a deploy or restart no longer makes the first write after it fail
+with 403, and every replica accepts the same token. `GET /api/me` re-mints the
+cookie when it is missing, expired, or from the old scheme. `CsrfStore`,
+`AppState.csrf` and the hourly `csrf-cleanup` job are gone; drop any app code
+that touched them.
+
+**5.7.1 — skateboard-ui 5.2.2.** `useListData(url, sort, { live: true })`
+refetches quietly every minute while the page is visible; a page opened
+before a deploy reloads once instead of failing to import a chunk; dark mode
+has stronger card, border and muted-text contrast; Header titles are larger
+and bolder.
+
+**5.7.0 — shared libSQL, theme fix.** Set `LIBSQL_URL` to run against a
+shared libSQL (`sqld`) server over Hrana HTTP instead of the local SQLite
+file; the namespace is `config.json` `database.db`. The Hrana client replaces
+its stream baton after every response, including errors, so a failed
+statement inside a transaction cannot leave a pooled connection sending a
+spent baton. `public/theme-init.js` now treats a saved `system` theme as the
+system setting instead of light.
+
 **5.6.0 — security, upgrade promptly.** Parser panics no longer kill HTTP
 workers (`catch_unwind` around `handle_connection` plus a live-count drop
 guard). Request reads have a 15s wall-clock budget and keep-alive idles 30s,
@@ -62,11 +246,11 @@ Summary of required work (do all of it):
 2. Refresh scripts/update-skateboard.js from skateboard master; run with --yes (use --baseline if needed).
 3. Resolve conflicts; ensure zero-crate Rust backend (empty [dependencies]); port any Hono routes to backend/src/routes.rs.
 4. npm install @stevederico/skateboard-ui@5.0.0 --save-exact && npm run verify:ui.
-5. Rewrite all @stevederico/skateboard-ui/icons and DynamicIcon imports to named lucide-react imports; add lucide-react dependency if missing.
-6. Keep @stevederico/skateboard-ui/shadcn/ui/* imports (exports remap in 5.0).
+5. Rewrite all @stevederico/skateboard-ui/icons and DynamicIcon imports to named imports from src/icons.ts (create it: an explicit `export { X } from 'lucide-react'` list; it is the only file that imports lucide-react); add lucide-react dependency if missing. (Later, at skateboard 5.17.0 / ui 5.13+, the funnel switches to `@stevederico/skateboard-ui/icons` and lucide-react is removed; see the 5.17.0 note above.)
+6. Import primitives from @stevederico/skateboard-ui/ui/* (the old shadcn/ui/* alias was removed in ui 5.17.0).
 7. Drop @vitejs/plugin-react-swc; let JSX come from tsconfig ("jsx": "react-jsx"); drop vite --force and optimizeDeps.force.
 8. Drop test:coverage* scripts if present.
-9. npm run typecheck && npm run test && (cd backend && cargo test --locked). Smoke sign-in + one API call.
+9. npm run typecheck && npm run test && (cd backend && cargo test --locked). Then npm run guardrails:install && npm run lint and fix every report (each message names the fix). Smoke sign-in + one API call.
 10. Set version and skateboardVersion to 5.0.0 (equal). Update app CHANGELOG. Commit on the branch; do not push without approval.
 
 Never touch src/constants.json, backend/config.json, or .env beyond what the updater merged. Prefer app-side AGENTS.md on conflicts.
@@ -74,7 +258,7 @@ Never touch src/constants.json, backend/config.json, or .env beyond what the upd
 
 ## Notes
 
-- The updater never touches app-owned files (`src/constants.json`, `src/components/*`, `src/main.tsx`, `src/assets/styles.css`, `backend/config.json`, `.env*`). Icon **rewrites inside** `src/components/*` are still required for 5.0 — do those manually (updater will not rewrite app imports).
+- The updater never touches app-owned files (`src/constants.json`, `src/components/*`, `src/main.tsx`, `src/icons.ts`, `src/assets/styles.css`, `backend/config.json`, `.env*`). Icon **rewrites inside** `src/components/*` are still required for 5.0 — do those manually (updater will not rewrite app imports); `npm run lint` lists every one.
 - skateboard-ui ≥3.10.0 ships its own TypeScript declarations, so the old `src/skateboard-ui.d.ts` shim is deleted on upgrade — a stale copy would shadow the package's real types.
 - `--baseline <version>` forces the 3-way merge baseline when `skateboardVersion` is wrong or was stamped prematurely. It also skips the "Already on latest" early-exit, so you can re-sync an app whose version was stamped without the files actually migrating.
 - If any file ends declined, conflicted, or errored, the updater does **not** stamp `skateboardVersion` — resolve the conflicts, then re-run with `--baseline <old-version>` to finish.

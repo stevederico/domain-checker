@@ -11,9 +11,6 @@ function walkRepo(dir, out = []) {
   for (const name of readdirSync(dir)) {
     if (name === 'node_modules' || name === 'databases' || name === 'dist' || name === 'target') continue;
     const full = join(dir, name);
-    // lstat (not stat): never follow symlinks. A symlinked backend/.env pointing at an
-    // a broken .env symlink would make statSync throw ENOENT and crash the whole suite. A
-    // symlink is never template-owned boilerplate to allowlist anyway — skip it.
     const st = lstatSync(full);
     if (st.isSymbolicLink()) continue;
     if (st.isDirectory()) walkRepo(full, out);
@@ -22,14 +19,6 @@ function walkRepo(dir, out = []) {
   return out;
 }
 
-// Regression guard for the 4.5.0 omission: the updater REFERENCED new boilerplate
-// (backend/lib/*, vite.plugins.ts, src/test/setup.js) but they were absent from the
-// ALLOWLIST, so `node scripts/update-skateboard.js` left apps with a broken build —
-// imports resolved to nothing. The invariant below makes a new backend file fail CI
-// unless it is allowlisted (or explicitly runtime/vendor).
-// This suite guards the TEMPLATE's own allowlist. It ships to apps (the test file is
-// allowlisted) but must NOT run there — an app legitimately has non-allowlisted backend
-// files (custom routes/services), which would false-fail. Run only in the skateboard repo.
 const IS_TEMPLATE = (() => {
   try { return JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8')).name === 'skateboard'; }
   catch { return false; }
@@ -41,15 +30,32 @@ describe('ALLOWLIST completeness', { skip: !IS_TEMPLATE }, () => {
   });
 
   it('every backend boilerplate file is allowlisted', () => {
-    // backend/ code is template-owned. Runtime/app-owned: databases/, config.json, .env*.
     const missing = walkRepo(join(REPO, 'backend'))
       .filter(f => !f.includes('/databases/') && !f.endsWith('config.json') && !f.includes('.env') && !f.endsWith('.DS_Store'))
       .filter(f => !ALLOWLIST.includes(f));
     assert.deepEqual(missing, [], `backend boilerplate missing from ALLOWLIST: ${missing.join(', ')}`);
   });
 
+  it('every guardrails file is allowlisted', () => {
+    const missing = ['eslint-plugin', 'verify']
+      .flatMap(dir => walkRepo(join(REPO, 'guardrails', dir)))
+      .filter(f => !f.endsWith('.DS_Store'))
+      .filter(f => !ALLOWLIST.includes(f));
+    assert.deepEqual(missing, [], `guardrails files missing from ALLOWLIST: ${missing.join(', ')}`);
+    for (const f of ['.oxlintrc.json', '.dependency-cruiser.js', 'guardrails/package.json', 'guardrails/package-lock.json']) {
+      assert.ok(ALLOWLIST.includes(f), `${f} must be synced`);
+    }
+  });
+
   it('allowlists the build infra new in 4.5.0', () => {
     assert.ok(ALLOWLIST.includes('vite.plugins.ts'), 'vite.plugins.ts must be synced');
+  });
+
+  it('drops ESLint, Playwright and require-jsdoc-on-exports from apps (5.23.0)', () => {
+    for (const f of ['eslint.config.js', 'guardrails/verify/playwright.config.js', 'guardrails/eslint-plugin/rules/require-jsdoc-on-exports.js']) {
+      assert.ok(REMOVED.includes(f), `${f} must be removed`);
+      assert.ok(!ALLOWLIST.includes(f), `${f} must not be synced`);
+    }
   });
 
   it('drops the old vitest harness from apps', () => {
@@ -58,10 +64,6 @@ describe('ALLOWLIST completeness', { skip: !IS_TEMPLATE }, () => {
   });
 });
 
-// Regression guard for the CLAUDE.md → AGENTS.md symlink flip. The bug: CLAUDE.md was a
-// regular allowlisted file, but once it became a symlink, `git show HEAD:CLAUDE.md` serves
-// the 9-byte target string "AGENTS.md", which the updater would write over an app's real
-// CLAUDE.md. Fix = allowlist AGENTS.md (content) + materialize CLAUDE.md as a symlink.
 describe('updater instruction-file config', () => {
   it('allowlists AGENTS.md (the real content file)', () => {
     assert.ok(ALLOWLIST.includes('AGENTS.md'), 'AGENTS.md must be synced so apps get the guidance');

@@ -1,16 +1,12 @@
 @import "@stevederico/skateboard-ui/styles.css";
 
-/* This app's plain CSS: the classes src/ uses that skateboard-ui's styles.css does not
-   define, a few shell rules repeated after them so they keep their precedence, and the
-   brand and dark-mode overrides. No Tailwind: edit by hand. A className token missing
-   here and in skateboard-ui's CSS fails lint (no-unknown-classes). */
 
 @layer theme {
   :root, :host {
-    --color-red-500: oklch(63.7% .237 25.331);
-    --color-yellow-500: oklch(79.5% .184 86.047);
-    --color-emerald-500: oklch(69.6% .17 162.48);
-    --color-app: var(--color-emerald-500);
+    --color-danger: oklch(63.7% .237 25.331);
+    --color-warning: oklch(79.5% .184 86.047);
+    --color-success: oklch(69.6% .17 162.48);
+    --color-app: var(--color-success);
   }
 }
 
@@ -104,8 +100,8 @@
     }
   }
 
-  .bg-emerald-500 {
-    background-color: var(--color-emerald-500);
+  .bg-success {
+    background-color: var(--color-success);
   }
 
   .bg-foreground {
@@ -150,16 +146,16 @@
     background-color: var(--primary);
   }
 
-  .bg-red-500 {
-    background-color: var(--color-red-500);
+  .bg-danger {
+    background-color: var(--color-danger);
   }
 
   .bg-transparent {
     background-color: #0000;
   }
 
-  .bg-yellow-500 {
-    background-color: var(--color-yellow-500);
+  .bg-warning {
+    background-color: var(--color-warning);
   }
 
   .bg-gradient-to-b {
@@ -197,8 +193,8 @@
     padding-right: calc(var(--spacing) * 24);
   }
 
-  .text-emerald-500 {
-    color: var(--color-emerald-500);
+  .text-success {
+    color: var(--color-success);
   }
 
   .text-muted-foreground, .text-muted-foreground\/50 {
@@ -225,8 +221,8 @@
     color: var(--primary);
   }
 
-  .text-red-500 {
-    color: var(--color-red-500);
+  .text-danger {
+    color: var(--color-danger);
   }
 
   .text-white {
@@ -672,6 +668,25 @@
   [data-slot="popover-content"] .\[\[data-slot\=popover-content\]_\&\]\:bg-transparent {
     background-color: #0000;
   }
+
+  .size-2\.5 {
+    width: calc(var(--spacing) * 2.5);
+    height: calc(var(--spacing) * 2.5);
+  }
+
+  .justify-start {
+    justify-content: flex-start;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .motion-safe\:animate-pulse {
+      animation: var(--animate-pulse);
+    }
+  }
+
+  .active\:scale-100:active {
+    scale: 1;
+  }
 }
 
 .gradient-btn {
@@ -703,5 +718,5 @@
 }
 
 :root {
-  --color-app: var(--color-emerald-500);
+  --color-app: var(--color-success);
 }

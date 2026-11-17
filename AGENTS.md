@@ -29,39 +29,39 @@ npm run test           # Frontend typecheck + script tests (no vitest)
 cd backend && cargo test --locked
 ```
 
+**Guardrails (lint, boundaries, runtime verify):**
+```bash
+npm run guardrails:install   # once: dependency-cruiser (+ TypeScript 5) into guardrails/
+npm run lint                 # oxlint + the local guardrails plugin (see Guardrails)
+npm run test:guardrails      # rule tests (each case runs through oxlint)
+npm run depcruise            # whole-graph import boundaries (.dependency-cruiser.js)
+npm run verify               # boots frontend + backend, clicks through the app with agent-browser
+```
+
+`oxlint` and `agent-browser` are global CLIs, not project dependencies: `mise use -g npm:oxlint npm:agent-browser` (or `npm install -g oxlint agent-browser`).
+
 ## Code Standards
 
 ### Documentation Requirements
 
 **CRITICAL: Documentation must always match code.**
 
-**All exported/public functions, classes, and non-obvious constants must have JSDoc comments (`/** */`).**
+**No comments in code, doc comments included (no JSDoc `/** */`).** Comments go stale, nobody reads them, and they give an agent a place to justify a workaround instead of fixing the cause. Put the contract in a clear name, the TypeScript types, a test, or a lint rule.
 
-**Required:**
-- All exported/public functions and classes
-- Parameters, return types, and thrown errors/exceptions
-- Non-obvious constants and configuration objects
-- Complex logic via inline comments explaining *why*, not *what*
-
-**Exempt:**
-- Trivial getters/setters where the name is self-documenting
-- One-liner utility functions with obvious intent (e.g., `const isEven = (n) => n % 2 === 0`)
-- Private/internal helpers under ~3 lines where intent is clear from context
-- Third-party and imported code (e.g., shadcn components, library wrappers)
+- New and edited code adds no comments. Existing comments go when someone edits the code around them.
+- Allowed: lint disable directives (`// oxlint-disable-next-line skateboard/<rule> -- <reason>`), `yagni:` markers (a deliberate shortcut with its ceiling and upgrade path), license headers, and shebangs.
+- Never leave commented-out code; git remembers.
 
 When making ANY code changes, you MUST update:
-- JSDoc comments on modified functions/classes/components
-- Inline comments explaining complex logic
 - README.md if user-facing behavior changes
 - AGENTS.md if architecture/patterns change
 - API docs if endpoints change
 - CHANGELOG.md for all changes (see commit protocol)
 
 **Before committing:**
-1. Review all modified functions — do JSDoc comments match current signatures and behavior?
-2. Check that parameter names, types, and descriptions are accurate
-3. Remove doc comments for deleted functions — don't leave orphaned docs
-4. Verify examples in docs still work with changes
+1. Check that names and types still say what the code does, and that no comments were added
+2. Verify examples in docs still work with changes
+3. If any version changed, run the grep audit above and confirm zero stale hits
 
 **Out-of-date documentation is worse than no documentation.**
 
@@ -95,7 +95,7 @@ When making ANY code changes, you MUST update:
 
 - TypeScript everywhere — `.ts` / `.tsx` files, `strict` mode always on
 - No build-step typechecking: `npm run typecheck` runs `tsc -p tsconfig.json` (`noEmit` is set in tsconfig) for the frontend; it gates `build`, `prod`, and `test`. Backend is `cargo test`.
-- `@types` packages are dev-only dependencies (`@types/node`, `@types/react`, `@types/react-dom`)
+- `@types` packages are dev-only dependencies (`@types/react`, `@types/react-dom`). No `@types/node`: `tsconfig.json` checks only `src/` (browser code); Node files (`vite.config.ts`, `vite.plugins.ts`, `scripts/`) run under Node's own type stripping and are not in its `include`. Add `@types/node` back only if `src/` ever needs Node types
 - Prefer `const` over `let` — use `let` only when reassigning
 - Prefer `async`/`await` over `.then()` chains
 - Prefer destructuring: `const { id } = user` over `const id = user.id`
@@ -125,9 +125,54 @@ All of these silence the compiler instead of proving correctness:
 - Never use `require()` — ES modules only
 - Never add a database driver package — the backend is SQLite through system `libsqlite3` FFI
 - Never use axios, got, or similar — native `fetch` only
-- Never use PostCSS, autoprefixer, or `tailwind.config.js`
-- Never use ESLint or the `globals` package
+- Never use Tailwind (`tailwindcss`, `@tailwindcss/vite`), PostCSS, autoprefixer, or `tailwind.config.js` (lint: `no-banned-build-tooling`)
+- oxlint is the only linter, and it runs only the local guardrails plugin (`guardrails/eslint-plugin`, loaded through `jsPlugins`, see **Guardrails** below) plus four core rules — never add ESLint, its parsers, third-party rule packs, shareable configs or other `jsPlugins`, and never the `globals` package (lint: `no-eslint-or-playwright`, `no-globals-package`)
+- Runtime verify drives the `agent-browser` CLI — never add Playwright, Puppeteer or another browser driver, and never download Playwright's browsers (lint: `no-eslint-or-playwright`)
 - Minimize external packages — use built-in/native solutions when possible
+
+### Guardrails
+
+Every written "never / don't" rule an agent keeps breaking becomes a machine check whose error message teaches the root cause and the fix. The rules in this file are the spec; `npm run lint` enforces the ones a single file's AST or filename can prove.
+
+```bash
+mise use -g npm:oxlint npm:agent-browser   # once per machine: the two global CLIs
+npm run guardrails:install   # once: installs dependency-cruiser (+ TypeScript 5) into guardrails/ (nested, pinned)
+npm run lint                 # oxlint: all guardrails over src/, scripts/, vite.*, guardrails/
+npm run test:guardrails      # node --test: every rule's valid/invalid cases, each linted by the real oxlint
+npm run depcruise            # dependency-cruiser over the whole import graph
+npm run verify               # agent-browser flows against the running app, screenshots to verify-artifacts/
+```
+
+- **Linter:** oxlint (a global CLI) is the only linter. `.oxlintrc.json` at the root loads the plugin through `jsPlugins`, turns oxlint's own categories off (`plugins: []`, `correctness: off`), enables the four core rules (`no-var`, `prefer-const`, `object-shorthand`, `prefer-template`), and splits the plugin's rules into two `overrides`: base rules on every linted file, app (React/UI) rules on `src/` only. It also fails on warnings and on unused disable directives. `guardrails/eslint-plugin/index.test.js` asserts the overrides list exactly the plugin's `BASE_RULES` and `APP_RULES`.
+- **Where:** `guardrails/eslint-plugin/` — zero-dependency ES modules written against the ESLint rule API that oxlint's `jsPlugins` implement (the directory keeps that name; ESLint itself is not installed), one file per rule in `rules/` with a `<rule>.test.js` next to it. `lib/ruleTester.js` runs each test case through the real `oxlint` binary on a fixture file in a temp dir (with the case's `filename` and `options`) and checks every message by `messageId` and `data`.
+- **Why nested:** the root keeps TypeScript 7 (no JS API); dependency-cruiser and the TypeScript 5 compiler API it reads `.ts` imports with live in `guardrails/package.json`. Do not add them to the root. oxlint and agent-browser are global CLIs; CI installs pinned versions with `npm install -g`.
+- **Adding a rule:** when you write a new "never" rule here or in `skills/skateboard/rules/*.md`, add a lint rule for it if it is checkable from one file. Every message must say what was found, `Why:` the repo forbids it, and `Fix:` with the exact skateboard-ui export or pattern (the test harness asserts this). Register it in `guardrails/eslint-plugin/index.js`, enable it in the matching `.oxlintrc.json` override, and add it to the updater ALLOWLIST (`scripts/update-skateboard.js` `GUARDRAIL_RULES`). A rule that takes options must declare a `schema` (oxlint refuses options otherwise).
+- **Disabling:** only with `// oxlint-disable-next-line skateboard/<rule> -- <reason>` (oxlint also honors `eslint-disable-*`); unused disables fail lint.
+- **Layers:** `guardrails/eslint-plugin/layers.js` is the layer table (`ui` = src/components, `app` = rest of src/, `server` = backend/, `tooling` = scripts/, `build` = vite.*, `guardrails`) and the allowed import edges. `skateboard/layer-boundaries` enforces it per file, and `.dependency-cruiser.js` generates its layer rules from the same table (never hand-copy a layer into either).
+- **Boundaries (`npm run depcruise`):** dependency-cruiser resolves every import on disk, so it proves what one file cannot: the layer table across the graph, no circular dependencies, no orphan modules, no devDependencies or Node builtins in `src/`, no packages missing from `package.json`, no unresolvable imports (including deep paths a package's `exports` map does not expose), no relative paths into `node_modules/`, no imports of test files. Each rule's `comment` states the root cause and the fix. Needs `npm ci` and `npm run guardrails:install` first.
+- **Runtime verify (`npm run verify`):** `guardrails/verify/verify.e2e.js` (run by `node --test`) drives the `agent-browser` CLI through this app's pages: the landing redirect to the checker, a taken name (`google`, all 12 TLDs listed), a fresh name whose `.com` row copies with a toast, the command menu, guest settings, the three legal pages and the 404, against the real Vite dev server (:5173) and the real Rust backend (`cargo run` on :8000, throwaway SQLite under `verify-artifacts/`; nothing is mocked). Elements are found in agent-browser's accessibility snapshot by role and name (`guardrails/verify/browser.js`), the way a screen reader sees them. It fails on uncaught exceptions, console errors and unexpected failed requests (HTTP 4xx/5xx), and saves full-page screenshots to `verify-artifacts/screenshots/` (gitignored). agent-browser launches its own headless Chrome or Chromium in a private session (`--session skateboard-verify-<pid>`, config `verify-artifacts/agent-browser.json`, so a personal agent-browser config that attaches to a running browser is not used); set `AGENT_BROWSER_EXECUTABLE_PATH` if it cannot find one. Ports 5173 and 8000 must be free. Unit tests stay on `node --test` too, so flow files are named `*.e2e.js`, never `*.test.js` / `*.spec.js`. When you change a view the flows assert, update the flow in the same change.
+- **CI:** this app has no `.github/workflows` yet. The template's `ci.yml` (job `guardrails`: lint, rule tests, depcruise) and `verify.yml` (the flows on every pull request) are not synced by the updater; copy them when the app gets CI. The flows call real WHOIS/RDAP servers, so they need outbound network.
+
+**Written rules that are NOT linted (and why):**
+
+| Rule | Why not linted |
+|---|---|
+| Never disable/loosen `strict` in tsconfig; `@types` dev-only; `vite --force` in scripts; dependency pins in docs; version/`skateboardVersion` sync | Not JS/TS source (JSON, Markdown). `npm run typecheck` and `scripts/version-consistency.test.js` cover the version parts |
+| No comments in code, doc comments included | Applies to new and edited lines; existing comments go when their code is edited. A whole-file rule would fail every app that still carries the JSDoc the removed `require-jsdoc-on-exports` rule demanded. Review |
+| oxlint and agent-browser stay global CLIs, not `package.json` dependencies | `package.json` is JSON; review (`no-eslint-or-playwright` covers the tools they replaced) |
+| Backend rules (zero crates, no `cargo add`, never hand-roll TLS, scrypt/JWT) | Rust — `cargo test`, review |
+| Optional chaining / nullish coalescing, prefer destructuring, array methods over loops, default params | "Prefer" style calls; the useful versions need type information |
+| Boolean names prefixed `is`/`has`/`should` | Needs type information to know a value is boolean |
+| ~50 lines per function, ~150 lines per component, single responsibility, no magic numbers | Judgment calls with explicit "~" budgets |
+| Max 3 levels of component nesting, prop drilling beyond 2 levels, colocate state | Cross-file component tree (dependency-cruiser sees imports, not JSX nesting or props) |
+| Exactly one `<main>` per page, heading hierarchy, semantic HTML choice | Need the rendered page across shell + view files |
+| Contrast ratios, touch targets ≥ 44px, focus-indicator contrast, color not the only signal | Need computed styles at runtime |
+| Escape closes modals, focus trap/restore, arrow keys in composite widgets | Runtime behavior (provided by skateboard-ui primitives) |
+| Every list has an empty state, every error is visible, partial success, loading > 200 ms | UI behavior across states; `use-list-data-states` and `no-empty-catch` cover the mechanical parts |
+| External API rate limits, backoff, circuit breaker, no batch endpoint in a loop | Runtime policy per API |
+| Never mock the module under test, one assertion per `it`, prefer real implementations | Test-design judgment |
+| Margin between siblings, 3-5 colors per view, max 2 font families, no decorative shapes, AlertDialog for destructive actions | Design judgment (raw colors, `space-*`, arbitrary values, and `dark:` are linted) |
+| Keep credentials out of logs | Data-flow analysis (hard-coded connection strings are linted) |
 
 ## Error Handling (MANDATORY)
 
@@ -186,15 +231,16 @@ All of these silence the compiler instead of proving correctness:
 
 ## Styling & UI
 
-- Always use tailwindcss v4+ with @tailwindcss/vite plugin
-- Style using utility classes on elements, not central CSS
+- Plain CSS, no Tailwind: skateboard-ui's `styles.css` (its components and theme) plus this app's `src/assets/styles.css` (the classes `src/` uses, brand and dark-mode overrides). Both are edited by hand
+- Style using utility-style classes on elements (`flex`, `gap-4`, `bg-background`). Every className token must be defined in one of those two files (lint: `no-unknown-classes`); for a new class, add its rule to `src/assets/styles.css` in the matching `@layer`, using the theme variables (`var(--spacing)`, `var(--muted)`)
+- Theme values are plain CSS variables (`:root { --color-app: var(--color-purple-500); }`, `.dark { ... }`), never `@theme`, `@apply` or `@source`
 - Support dark mode with bg-background, bg-accent — never manual `dark:` overrides (`dark:bg-gray-800`), semantic tokens handle it
 - Use semantic color tokens (`bg-background`, `text-foreground`, `border-border`) — never raw colors (`bg-white`, `text-gray-500`)
 - Use `gap-*` between flex/grid children — never `space-x-*` / `space-y-*`, never margin between siblings for spacing
 - Limit palette to 3-5 semantic colors per view — don't rainbow
 - Max 2 font families — 1 heading + 1 body (default: Geist Sans + Geist Mono)
 - Use `rounded-md` / `rounded-lg` from design tokens — never arbitrary `rounded-[12px]`
-- Prefer Tailwind scale values (`p-4`, `gap-6`) — never arbitrary values (`p-[16px]`, `gap-[24px]`)
+- Prefer scale values (`p-4`, `gap-6`) — never arbitrary values (`p-[16px]`, `gap-[24px]`)
 - Use `size-*` for square elements — never `w-10 h-10` when `size-10` works
 - Use `text-balance` or `text-pretty` on headings and titles
 - Use `cn()` for conditional class composition — never template literal ternaries
@@ -204,11 +250,13 @@ All of these silence the compiler instead of proving correctness:
 
 ### Icons
 
-- Default library: Lucide React (`lucide-react`) — runtime dep of skateboard-ui **5.0** (hoisted); apps should declare it too
-- **Always named-import from `lucide-react`:** `import { Plus, Trash2 } from 'lucide-react'`
-- **Never** import from `@stevederico/skateboard-ui/icons` or `@stevederico/skateboard-ui/icons/*` — removed in 5.0 (was 4.18)
+- Default library: Lucide, vendored by skateboard-ui **5.13+** and exported from `@stevederico/skateboard-ui/icons`. Apps do **not** depend on `lucide-react` (the boilerplate dropped it in 5.17.0)
+- **One icon funnel:** `src/icons.ts` is the only module that imports `@stevederico/skateboard-ui/icons`. It re-exports an explicit, named list (no `export *`) of every icon the app uses
+- **Components import from the funnel:** `import { Plus, Trash2 } from '../icons'`. To use a new icon, add its Lucide name to `src/icons.ts` first
+- Why: one list keeps the icon set auditable and tree-shakeable, and lets the app swap an icon for a local SVG in one place (rename to `icons.tsx` when it holds JSX). An icon skateboard-ui does not export fails the typecheck; add it as a local SVG component in the funnel
+- **Never** import `@stevederico/skateboard-ui/icons` outside the funnel, never import `lucide-react` at all, and never deep paths (`@stevederico/skateboard-ui/icons/*`, `lucide-react/dist/...`, anything through `node_modules/`, `@stevederico/skateboard-ui/dist/...`) — lint enforces all three
 - **Never** use public DynamicIcon — removed in 5.0 (was 4.17); shell-only `constantsIcon` resolves `constants.json` icon strings
-- When migrating from 4.x: rewrite every `skateboard-ui/icons` and `DynamicIcon` import to a named `lucide-react` import (see **Migrating 4.x → 5.0**)
+- When migrating from 4.x: rewrite every `skateboard-ui/icons` and `DynamicIcon` import to a named import from the `src/icons.ts` funnel (see **Migrating 4.x → 5.0**)
 - Never use emoji as UI icons — use proper icon components (exception: `constants.json` feature icons where the shell renders unknown/legacy values as text)
 - Icon-only buttons must have `aria-label`
 - Standard sizes: 16px inline, 18px buttons, 24px cards, 48px empty states
@@ -400,12 +448,19 @@ skateboard/
 │   ├── assets/
 │   │   └── styles.css   # Brand color override (7 lines)
 │   ├── main.tsx         # Route definitions + lazy view imports
+│   ├── icons.ts         # Icon funnel: the only skateboard-ui/icons import
 │   └── constants.json   # All your app config
 ├── backend/
 │   ├── src/             # Zero-crate Rust server
 │   ├── Cargo.toml       # Empty [dependencies]
 │   ├── databases/       # SQLite database files
 │   └── config.json      # Backend config with database settings
+├── guardrails/
+│   ├── eslint-plugin/   # Local lint rules for oxlint jsPlugins (one per written "never" rule)
+│   ├── verify/          # agent-browser flows for `npm run verify`
+│   └── package.json     # Nested: dependency-cruiser + TypeScript 5 (not root deps)
+├── .oxlintrc.json       # oxlint: loads the guardrails plugin, base/app overrides
+├── .dependency-cruiser.js  # Import-graph boundaries, generated from the layer table
 ├── package.json         # Dependencies (includes skateboard-ui)
 ├── tsconfig.json        # Frontend TypeScript config (strict)
 └── vite.config.ts       # Vite configuration (app-owned)
@@ -421,7 +476,7 @@ skateboard/
 ### Frontend Stack
 - React, Vite, skateboard-ui (routing via `useSafeNavigate`)
 - TypeScript (`strict`, no-build-step typecheck), ES modules only
-- Tailwind CSS v4+ with @tailwindcss/vite plugin
+- Plain CSS (skateboard-ui `styles.css` + `src/assets/styles.css`), no Tailwind or PostCSS
 
 ### Backend Stack
 - Runtime: zero-crate Rust (`std::net::TcpListener` + OS threads). Empty `[dependencies]`.
@@ -453,7 +508,7 @@ skateboard/
 **Vite Configuration** (v1.1+ app-owned):
 Apps own their `vite.config.ts` directly. See [reference implementation](https://github.com/stevederico/skateboard/blob/master/vite.config.ts).
 
-- JSX via Vite's built-in esbuild (`jsx: 'automatic'`) — no `@vitejs/plugin-react-swc`
+- JSX comes from `tsconfig.json` (`"jsx": "react-jsx"`) via Vite's own transform — no `esbuild` block in `vite.config.ts`, no `@vitejs/plugin-react-swc`
 - Do **not** pass `vite --force` or set `optimizeDeps.force: true` in normal dev (causes full dep re-bundle every start)
 - Dev edits full-reload the page (no React Fast Refresh plugin)
 
@@ -462,9 +517,9 @@ Apps own their `vite.config.ts` directly. See [reference implementation](https:/
 /* src/assets/styles.css */
 @import "@stevederico/skateboard-ui/styles.css";
 
-@source '../../node_modules/@stevederico/skateboard-ui';
+/* plain CSS (no Tailwind): classes src/ uses that skateboard-ui does not define */
 
-@theme {
+:root {
   --color-app: var(--color-purple-500);
 }
 ```
@@ -473,8 +528,9 @@ Apps own their `vite.config.ts` directly. See [reference implementation](https:/
 
 ### Frontend
 
-- **`src/main.tsx`** — Single route (`home`) using `createSkateboardApp()`
+- **`src/main.tsx`** — Single route (`home`) using `createSkateboardApp()`. The layout override mounts `CommandMenu` and sonner's `<Toaster />` (skateboard-ui dropped its own Toaster in 3.0.0, so the app mounts it for the copy toasts)
 - **`src/components/HomeView.tsx`** — Domain checker UI. Debounced input (300ms), concurrent API calls, two-column result grid with `DomainRow` component
+- **`src/icons.ts`** — Icon funnel: `Circle`, `Search` from `@stevederico/skateboard-ui/icons`
 - **`src/constants.json`** — App config. `noLogin: true` (no auth required)
 
 ### Backend (`backend/src/routes.rs`, `backend/src/check.rs`)
@@ -519,9 +575,11 @@ CLI that generates short, spellable names locally (`spellableName`, `patternName
 
 ### UI Indicators (HomeView.tsx → DomainRow component)
 
-- **Green dot** (`bg-emerald-500`) — WHOIS/RDAP confirmed available. Click to copy domain.
-- **Yellow dot** (`bg-yellow-500`) — DNS-inferred available. Click to copy with "likely" label.
-- **Red dot** (`bg-red-500`) — Taken. Non-clickable, muted text.
+- **Green dot** (`bg-success`) — WHOIS/RDAP confirmed available. A ghost `<Button>`; click to copy the domain.
+- **Yellow dot** (`bg-warning`) — DNS-inferred available. Click to copy, with a "likely" label.
+- **Red dot** (`bg-danger`) — Taken. Non-clickable, muted text.
+
+The status tokens `--color-success`, `--color-warning` and `--color-danger` (and their `bg-*` / `text-*` classes) live in `src/assets/styles.css`; skateboard-ui defines none of them, and its `destructive` is too dark for text in dark mode.
 - **Gray dot** — Loading or unknown.
 
 ### Supported TLDs
@@ -550,11 +608,9 @@ CLI that generates short, spellable names locally (`spellableName`, `patternName
 
 ## UI Components — shadcn Primitives
 
-**Always use the shadcn primitives from `@stevederico/skateboard-ui/shadcn/ui` when building views.** The goal is the standard shadcn design look and feel — clean, consistent, and composable.
+**Always use the shadcn primitives from `@stevederico/skateboard-ui/ui` when building views.** The goal is the standard shadcn design look and feel — clean, consistent, and composable.
 
-**Import path:** `@stevederico/skateboard-ui/shadcn/ui/<component>`
-
-(From skateboard-ui **5.0**, that path is a package `exports` remap onto `ui/` — there are no linker shim files. Same import string for apps.)
+**Import path:** `@stevederico/skateboard-ui/ui/<component>`
 
 **Available components:**
 `accordion`, `alert`, `alert-dialog`, `avatar`, `badge`, `button`, `calendar`, `card`, `checkbox`, `collapsible`, `command`, `dialog`, `drawer`, `dropdown-menu`, `empty`, `field`, `input`, `kbd`, `label`, `pagination`, `popover`, `progress`, `radio-group`, `scroll-area`, `select`, `separator`, `sheet`, `sidebar`, `skeleton`, `slider`, `spinner`, `switch`, `table`, `tabs`, `textarea`, `toggle`, `toggle-group`, `tooltip`
@@ -563,13 +619,13 @@ CLI that generates short, spellable names locally (`spellableName`, `patternName
 - Prefer shadcn components over custom HTML elements (e.g., use `<Button>` not `<button>`, `<Card>` not `<div className="card">`)
 - Compose views from these primitives — don't reinvent patterns they already solve
 - Check available components before building custom UI; if shadcn has it, use it
-- Combine with Tailwind utility classes for layout and spacing
+- Combine with utility-style classes for layout and spacing (defined in skateboard-ui's or the app's CSS)
 - Before using a component for the first time, read its source — many use compound patterns, not prop APIs
 
 **Compound Components — these use sub-components, NOT props:**
 ```javascript
 // Empty state — compound pattern (NOT <Empty icon={} title={}>)
-import { Empty, EmptyHeader, EmptyMedia, EmptyTitle, EmptyDescription } from '@stevederico/skateboard-ui/shadcn/ui/empty';
+import { Empty, EmptyHeader, EmptyMedia, EmptyTitle, EmptyDescription } from '@stevederico/skateboard-ui/ui/empty';
 
 <Empty>
   <EmptyHeader>
@@ -581,10 +637,10 @@ import { Empty, EmptyHeader, EmptyMedia, EmptyTitle, EmptyDescription } from '@s
 </Empty>
 
 // Card — compound pattern
-import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@stevederico/skateboard-ui/shadcn/ui/card';
+import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@stevederico/skateboard-ui/ui/card';
 
 // Dialog — compound pattern
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@stevederico/skateboard-ui/shadcn/ui/dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@stevederico/skateboard-ui/ui/dialog';
 ```
 
 **Header — use `children` for right-side actions:**
@@ -603,12 +659,12 @@ import Header from '@stevederico/skateboard-ui/Header';
 
 **Standard imports:**
 ```javascript
-import { Button } from '@stevederico/skateboard-ui/shadcn/ui/button';
-import { Input } from '@stevederico/skateboard-ui/shadcn/ui/input';
-import { Label } from '@stevederico/skateboard-ui/shadcn/ui/label';
+import { Button } from '@stevederico/skateboard-ui/ui/button';
+import { Input } from '@stevederico/skateboard-ui/ui/input';
+import { Label } from '@stevederico/skateboard-ui/ui/label';
 ```
 
-Currently used in HomeView: `Input`, `Spinner`, `Kbd`.
+Currently used in HomeView: `Button`, `Input`, `Spinner`, `Kbd`.
 
 ## Key Implementation Patterns
 
@@ -637,10 +693,10 @@ const newDeal = await apiRequest('/deals', {
 
 ```javascript
 import { useListData } from '@stevederico/skateboard-ui/Utilities';
-import { Spinner } from '@stevederico/skateboard-ui/shadcn/ui/spinner';
-import { Empty, EmptyHeader, EmptyMedia, EmptyTitle, EmptyDescription } from '@stevederico/skateboard-ui/shadcn/ui/empty';
-import { Button } from '@stevederico/skateboard-ui/shadcn/ui/button';
-import { CircleAlert } from 'lucide-react';
+import { Spinner } from '@stevederico/skateboard-ui/ui/spinner';
+import { Empty, EmptyHeader, EmptyMedia, EmptyTitle, EmptyDescription } from '@stevederico/skateboard-ui/ui/empty';
+import { Button } from '@stevederico/skateboard-ui/ui/button';
+import { CircleAlert } from '../icons'; // add CircleAlert to src/icons.ts first
 
 function DealsView() {
   const { data, loading, error, refetch } = useListData('/deals');
@@ -719,7 +775,6 @@ When working with these libraries, consult the provided documentation before mak
 | shadcn/ui | https://ui.shadcn.com/llms.txt |
 | Vite | https://vite.dev/llms.txt |
 | Rust std | https://doc.rust-lang.org/std/ |
-| Tailwind CSS v4 | https://raw.githubusercontent.com/tailwindlabs/tailwindcss.com/refs/heads/md-endpoints/llms.txt |
 
 ## Agent skill (required reading)
 
@@ -729,10 +784,11 @@ This repo ships **`skills/skateboard/SKILL.md`** — the Cursor/Claude skill for
 
 **What agents must do:**
 1. Read `skills/skateboard/SKILL.md` first (and `skills/skateboard/rules/*` for icons/forms/styling/views as needed).
-2. Prefer shadcn primitives from `@stevederico/skateboard-ui/shadcn/ui/*` over raw HTML.
-3. Named-import icons from `lucide-react` only (see Icons below).
+2. Prefer shadcn primitives from `@stevederico/skateboard-ui/ui/*` over raw HTML.
+3. Import icons by name from the `src/icons.ts` funnel; only that file imports `@stevederico/skateboard-ui/icons` (see Icons below).
 4. Treat `skateboardVersion` as a label — verify the tree (especially `backend/`) matches the template before claiming an upgrade is done.
 5. For upgrades, follow **Migrating 4.x → 5.0** below (and `docs/UPGRADE.md`).
+6. Run `npm run lint` and `npm run depcruise` (after `npm run guardrails:install`) and fix what they report; each message names the fix. Run `npm run verify` after any UI or auth change (see **Guardrails**).
 
 Canonical pins live in this repo’s `package.json` (`version` / `skateboardVersion` / `@stevederico/skateboard-ui`). Refresh the skill metadata when those move.
 
@@ -741,7 +797,7 @@ Canonical pins live in this repo’s `package.json` (`version` / `skateboardVers
 **Reference:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/API.md](docs/API.md), [docs/SCHEMA.md](docs/SCHEMA.md), [docs/DEPLOY.md](docs/DEPLOY.md), [docs/MIGRATION.md](docs/MIGRATION.md)
 
 **Version:**
-- skateboard@5.6.0
+- skateboard@5.23.0
 - skateboard-ui@5.19.0
 
 ## Migrating 4.x → 5.0 (exact checklist)
@@ -780,17 +836,20 @@ Canonical pins live in this repo’s `package.json` (`version` / `skateboardVers
     # Find call sites
     rg -n "skateboard-ui/icons|DynamicIcon" src
     ```
-    - Replace `import { X } from '@stevederico/skateboard-ui/icons'` (and `/icons/X`) with `import { X } from 'lucide-react'`.
-    - Delete every `import DynamicIcon from '@stevederico/skateboard-ui/DynamicIcon'` — use a named Lucide icon in app code. Shell still resolves `constants.json` `icon` strings privately (`constantsIcon`); apps do not get a public dynamic resolver.
+    - Replace `import { X } from '@stevederico/skateboard-ui/icons'` (and `/icons/X`) with `import { X } from '../icons'`, and add `X` to the explicit `export { ... } from 'lucide-react'` list in `src/icons.ts` (the only file that imports `lucide-react`; see **Icons**).
+    - Delete every `import DynamicIcon from '@stevederico/skateboard-ui/DynamicIcon'` — use a named Lucide icon from the `src/icons.ts` funnel in app code. Shell still resolves `constants.json` `icon` strings privately (`constantsIcon`); apps do not get a public dynamic resolver.
     - Ensure `lucide-react` is listed in app `dependencies` (boilerplate ships it; ui 5.0 also depends on it).
+    - **Then continue to ui 5.13+ (boilerplate 5.17.0):** the funnel re-exports from `@stevederico/skateboard-ui/icons` instead of `lucide-react`, `lucide-react` leaves `dependencies`, and `react-router` joins them (a peer of ui since 5.12.0). See `docs/UPGRADE.md` → 5.17.0. **Then ui 5.16+ (boilerplate 5.18.0):** react-router is vendored inside skateboard-ui, so `react-router` leaves `dependencies` again and router imports come from `@stevederico/skateboard-ui/router`. See `docs/UPGRADE.md` → 5.18.0.
 
-11. **Keep shadcn import paths**
-    - Continue using `@stevederico/skateboard-ui/shadcn/ui/<name>`.
-    - Do **not** rewrite to `…/ui/<name>` unless you want to — both work; `shadcn/ui/*` is remapped via package `exports` (linker shim files are gone).
+11. **UI import paths**
+    - Use `@stevederico/skateboard-ui/ui/<name>`, `@stevederico/skateboard-ui/lib/utils` (`cn`) and `@stevederico/skateboard-ui/hooks/use-mobile`.
+    - The old `@stevederico/skateboard-ui/shadcn/...` paths were removed in skateboard-ui 5.17.0 (lint: `no-removed-skateboard-ui-imports`). Rewrite `/shadcn/ui/X` → `/ui/X`, `/shadcn/lib/utils` → `/lib/utils`, `/shadcn/hooks/X` → `/hooks/X`; `grep -rn "skateboard-ui/shadcn" src` must print nothing.
 
 12. **Routing**
-    - Apps must **not** depend on `react-router` / `react-router-dom` directly for shell navigation. Use `useSafeNavigate()` from `@stevederico/skateboard-ui/Utilities`.
-    - ui 5.0 pins `react-router@7.18.3` (CVE-2026-55685). Do not downgrade below 7.18.0.
+    - Apps must **not** import `react-router` / `react-router-dom` (lint: `no-direct-react-router`). Navigate with `useSafeNavigate()` from `@stevederico/skateboard-ui/Utilities`.
+    - skateboard-ui 5.16+ vendors react-router (7.18.5, past the CVE-2026-55685 fix in 7.18.3) and exports it: any other router API (`useParams`, `useSearchParams`, `Link`, `Navigate`, ...) comes from `@stevederico/skateboard-ui/router` (`react-router/dom` → `@stevederico/skateboard-ui/router/dom`). Same API, only the import path changes.
+    - Keep exactly one router copy: no `react-router` in `package.json`, none in `vite.config.ts` `resolve.dedupe` / `optimizeDeps.include`. Check with `grep -rnE "from ['\"]react-router(-dom)?(/[^'\"]*)?['\"]" src` (must print nothing). A second copy breaks router context: hooks throw "may be used only in the context of a <Router>" and `useSafeNavigate` falls back to full page loads.
+    - The router version moves only with the skateboard-ui pin. Its security advisories are not seen by `npm audit` (no dependency); skateboard-ui re-vendors when one applies.
 
 13. **Removed Utilities (already gone in late 4.x — confirm)**
     - No `useForm`, `logEvent`, or public `setSidebarVisible` / `setTabBarVisible` (use `showSidebar` / `hideSidebar` / `showTabBar` / `hideTabBar` if needed).
@@ -799,7 +858,7 @@ Canonical pins live in this repo’s `package.json` (`version` / `skateboardVers
 
 14. **Drop `@vitejs/plugin-react-swc`**
     - Remove from `package.json` `devDependencies` and from `vite.config.ts` plugins.
-    - Keep Vite esbuild JSX: `esbuild: { jsx: 'automatic', jsxImportSource: 'react' }`.
+    - JSX comes from `tsconfig.json` (`"jsx": "react-jsx"`); `vite.config.ts` needs no `esbuild` block.
     - Expect **full page reload** on edit (no React Fast Refresh plugin).
 
 15. **Drop forced dep re-optimize**
@@ -827,7 +886,7 @@ Canonical pins live in this repo’s `package.json` (`version` / `skateboardVers
 ### What 5.0 does *not* require
 
 - No rewrite of `constants.json` shape (icon **values** stay Lucide name strings).
-- No change to `@stevederico/skateboard-ui/shadcn/ui/*` import strings for apps.
+- No change to `@stevederico/skateboard-ui/ui/*` import strings for apps.
 - Calendar / CommandMenu / TextView / mid-tier primitives (accordion, progress, …) remain available.
 
 ## Updating from Skateboard Boilerplate
@@ -862,10 +921,12 @@ a version in `package.json`:
 - `backend/src/*` - Rust server
 - `vite.config.ts` - Build configuration
 - `src/assets/styles.css` - Theme variables (merge carefully)
+- `.oxlintrc.json`, `.dependency-cruiser.js`, `guardrails/` - Lint, boundary and runtime-verify guardrails (template-owned; `guardrails/verify/verify.e2e.js` asserts the template's views, so expect to merge it with your app's flows)
 
 ### Never Auto-Update (app-specific)
 - `constants.json` - App configuration
 - `src/components/*` - Custom components
+- `src/icons.ts` - The app's icon list
 - `backend/config.json` - Database/environment config
 
 ### Important

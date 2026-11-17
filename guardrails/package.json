@@ -1,0 +1,10 @@
+{
+  "name": "skateboard-guardrails",
+  "private": true,
+  "type": "module",
+  "description": "Boundary tooling for the skateboard template. Kept out of the root package so the app keeps TypeScript 7 while dependency-cruiser gets the TypeScript 5 compiler API it needs to read .ts imports. Lint (oxlint) and runtime verify (agent-browser) are global CLIs, not dependencies.",
+  "devDependencies": {
+    "dependency-cruiser": "18.7.2",
+    "typescript": "5.9.3"
+  }
+}

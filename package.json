@@ -1,8 +1,8 @@
 {
   "name": "domain-checker",
   "private": false,
-  "version": "5.13.0",
-  "skateboardVersion": "5.6.0",
+  "version": "5.14.0",
+  "skateboardVersion": "5.23.0",
   "type": "module",
   "scripts": {
     "start": "vite --mode development",
@@ -16,19 +16,24 @@
     "test": "npm run typecheck && npm run test:build && npm run test:docs",
     "typecheck": "tsc -p tsconfig.json",
     "test:build": "node --experimental-test-module-mocks --test vite.plugins.test.js scripts/verify-ui-version.test.js scripts/update-skateboard.test.js scripts/version-consistency.test.js scripts/hunt.test.js",
-    "test:docs": "node scripts/test-docs.mjs"
+    "test:docs": "node scripts/test-docs.mjs",
+    "guardrails:install": "npm ci --prefix guardrails --no-audit --no-fund",
+    "lint": "oxlint",
+    "test:guardrails": "node --test \"guardrails/eslint-plugin/**/*.test.js\"",
+    "depcruise": "node guardrails/node_modules/dependency-cruiser/bin/dependency-cruiser.mjs --config .dependency-cruiser.js .",
+    "verify": "node --test --test-reporter=spec guardrails/verify/verify.e2e.js"
   },
   "dependencies": {
     "@stevederico/skateboard-ui": "5.19.0",
-    "react": "19.2.8",
-    "react-dom": "19.2.8",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
     "sonner": "^2.0.7"
   },
   "devDependencies": {
-    "@types/react": "19.2.18",
-    "@types/react-dom": "19.2.7",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
     "typescript": "7.0.2",
-    "vite": "8.2.2"
+    "vite": "8.3.7"
   },
   "engines": {
     "node": ">=24.0.0"
