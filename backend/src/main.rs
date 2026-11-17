@@ -85,14 +85,26 @@ extern "C" {
 }
 
 fn spawn_cleanup(state: Arc<AppState>) {
-    spawn_periodic(&state, "lockout-cleanup", 15 * 60, routes::run_lockout_cleanup);
-    spawn_periodic(&state, "webhook-cleanup", 60 * 60, routes::run_webhook_cleanup);
+    spawn_periodic(
+        &state,
+        "lockout-cleanup",
+        15 * 60,
+        routes::run_lockout_cleanup,
+    );
+    spawn_periodic(
+        &state,
+        "webhook-cleanup",
+        60 * 60,
+        routes::run_webhook_cleanup,
+    );
     spawn_periodic(&state, "check-rate-cleanup", 5 * 60, run_check_rate_cleanup);
 }
 
 /// Drop expired `/api/check` rate-limit buckets. The Hono server did this every 5 minutes.
 fn run_check_rate_cleanup(state: &AppState) {
-    let removed = state.check_rate.cleanup(skateboard_backend::config::now_ms());
+    let removed = state
+        .check_rate
+        .cleanup(skateboard_backend::config::now_ms());
     if removed > 0 {
         state.log.debug(
             "Check rate cleanup completed",
@@ -101,12 +113,7 @@ fn run_check_rate_cleanup(state: &AppState) {
     }
 }
 
-fn spawn_periodic(
-    state: &Arc<AppState>,
-    name: &str,
-    period_secs: u64,
-    task: fn(&AppState),
-) {
+fn spawn_periodic(state: &Arc<AppState>, name: &str, period_secs: u64, task: fn(&AppState)) {
     let state_for_thread = Arc::clone(state);
     let spawned = thread::Builder::new()
         .name(name.to_string())

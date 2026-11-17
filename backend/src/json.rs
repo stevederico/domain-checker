@@ -370,7 +370,8 @@ impl<'a> Parser<'a> {
                 self.i += 1;
             }
         }
-        let text = std::str::from_utf8(&self.b[start..self.i]).map_err(|_| self.err("bad number"))?;
+        let text =
+            std::str::from_utf8(&self.b[start..self.i]).map_err(|_| self.err("bad number"))?;
         text.parse::<f64>()
             .map(Json::Num)
             .map_err(|_| self.err("bad number"))

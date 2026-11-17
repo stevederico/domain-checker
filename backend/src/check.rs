@@ -162,9 +162,15 @@ pub fn handle(req: &Request, ip: &str, rate: &CheckRateStore) -> Response {
         Some(false) => 1,
         None => 2,
     });
-    json_res(200, &Json::Arr(results.into_iter().map(CheckResult::to_json).collect()))
-        .set_header("Cache-Control", "no-store, no-cache, must-revalidate, private")
-        .set_header("Pragma", "no-cache")
+    json_res(
+        200,
+        &Json::Arr(results.into_iter().map(CheckResult::to_json).collect()),
+    )
+    .set_header(
+        "Cache-Control",
+        "no-store, no-cache, must-revalidate, private",
+    )
+    .set_header("Pragma", "no-cache")
 }
 
 /// Parse `{ "domain": "name", "tlds"?: ["com", "ai"] }`.
@@ -322,11 +328,17 @@ impl Outcome {
 }
 
 fn whois_server(tld: &str) -> Option<&'static str> {
-    WHOIS_SERVERS.iter().find(|(k, _)| *k == tld).map(|(_, s)| *s)
+    WHOIS_SERVERS
+        .iter()
+        .find(|(k, _)| *k == tld)
+        .map(|(_, s)| *s)
 }
 
 fn rdap_base(tld: &str) -> Option<&'static str> {
-    RDAP_SERVERS.iter().find(|(k, _)| *k == tld).map(|(_, s)| *s)
+    RDAP_SERVERS
+        .iter()
+        .find(|(k, _)| *k == tld)
+        .map(|(_, s)| *s)
 }
 
 fn parse_whois(body: &str) -> Outcome {
@@ -659,7 +671,8 @@ mod tests {
 
     #[test]
     fn whois_taken_beats_available_disclaimer() {
-        let body = "Domain Name: EXAMPLE.COM\nRegistrar: Example\nThis domain is available through...";
+        let body =
+            "Domain Name: EXAMPLE.COM\nRegistrar: Example\nThis domain is available through...";
         let out = parse_whois(body);
         assert_eq!(out.available, Some(false));
         assert_eq!(out.status, "taken");
@@ -766,7 +779,10 @@ mod tests {
         let mut buf = vec![0x12, 0x34, 0x81, 0x83, 0, 1, 0, 0, 0, 0, 0, 0];
         let header = parse_dns_header(&buf, 0x1234).unwrap();
         assert!(header.rcode == 3 && header.ancount == 0 && !header.truncated);
-        assert_eq!(classify_reply(header.rcode, header.ancount), DnsKind::NxDomain);
+        assert_eq!(
+            classify_reply(header.rcode, header.ancount),
+            DnsKind::NxDomain
+        );
         buf[2] = 0x01;
         assert!(parse_dns_header(&buf, 0x1234).is_none());
     }
@@ -799,9 +815,7 @@ mod tests {
     fn tld_order_matches_the_hono_maps() {
         assert_eq!(
             SUPPORTED_TLDS,
-            [
-                "com", "net", "org", "io", "co", "xyz", "ai", "shop", "site", "tech", "dev", "app",
-            ]
+            ["com", "net", "org", "io", "co", "xyz", "ai", "shop", "site", "tech", "dev", "app",]
         );
     }
 

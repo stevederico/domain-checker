@@ -1182,14 +1182,17 @@ mod tests {
     fn query_rejects_more_than_one_statement() {
         let tmp = TempDb::new("multi-stmt");
         let pool = Pool::open(&tmp.path(), 1).unwrap();
-        pool.insert_user(&sample_user("u1", "a@example.com")).unwrap();
+        pool.insert_user(&sample_user("u1", "a@example.com"))
+            .unwrap();
 
         let err = pool
             .with(|db| db.run("DELETE FROM Users; DELETE FROM Auths", &[]))
             .expect_err("a second statement must be refused, not dropped");
         assert!(err.message.contains("more than one statement"), "{err}");
         assert!(
-            pool.find_user(&UserQuery::Id("u1".into())).unwrap().is_some(),
+            pool.find_user(&UserQuery::Id("u1".into()))
+                .unwrap()
+                .is_some(),
             "nothing should have run"
         );
     }
@@ -1198,7 +1201,8 @@ mod tests {
     fn query_allows_trailing_semicolons_and_whitespace() {
         let tmp = TempDb::new("trailing-semi");
         let pool = Pool::open(&tmp.path(), 1).unwrap();
-        pool.insert_user(&sample_user("u1", "a@example.com")).unwrap();
+        pool.insert_user(&sample_user("u1", "a@example.com"))
+            .unwrap();
         let rows = pool
             .with(|db| db.query("SELECT _id FROM Users ;  \n", &[]))
             .expect("a trailing semicolon is not a second statement");
@@ -1219,8 +1223,14 @@ mod tests {
             insert_user_tx(db, &sample_user("u2", "b@example.com"))
         })
         .unwrap();
-        assert!(pool.find_user(&UserQuery::Id("u1".into())).unwrap().is_some());
-        assert!(pool.find_user(&UserQuery::Id("u2".into())).unwrap().is_some());
+        assert!(pool
+            .find_user(&UserQuery::Id("u1".into()))
+            .unwrap()
+            .is_some());
+        assert!(pool
+            .find_user(&UserQuery::Id("u2".into()))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1233,7 +1243,9 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(
-            pool.find_user(&UserQuery::Id("u1".into())).unwrap().is_none(),
+            pool.find_user(&UserQuery::Id("u1".into()))
+                .unwrap()
+                .is_none(),
             "the first insert must not survive a later failure"
         );
     }
@@ -1250,12 +1262,17 @@ mod tests {
         }));
         assert!(panicked.is_err());
         assert!(
-            pool.find_user(&UserQuery::Id("u1".into())).unwrap().is_none(),
+            pool.find_user(&UserQuery::Id("u1".into()))
+                .unwrap()
+                .is_none(),
             "the panicking transaction must have been rolled back"
         );
         pool.transaction(|db| insert_user_tx(db, &sample_user("u2", "b@example.com")))
             .expect("connection must be reusable after a panic");
-        assert!(pool.find_user(&UserQuery::Id("u2".into())).unwrap().is_some());
+        assert!(pool
+            .find_user(&UserQuery::Id("u2".into()))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1274,7 +1291,9 @@ mod tests {
             .expect_err("duplicate credentials must fail");
         assert!(err.message.contains("UNIQUE constraint failed"), "{err}");
         assert!(
-            pool.find_user(&UserQuery::Id("u1".into())).unwrap().is_none(),
+            pool.find_user(&UserQuery::Id("u1".into()))
+                .unwrap()
+                .is_none(),
             "a failed signup must not leave a user row holding the email"
         );
     }
@@ -1283,7 +1302,8 @@ mod tests {
     fn consume_usage_stops_at_the_limit() {
         let tmp = TempDb::new("usage-limit");
         let pool = Pool::open(&tmp.path(), 2).unwrap();
-        pool.insert_user(&sample_user("u1", "a@example.com")).unwrap();
+        pool.insert_user(&sample_user("u1", "a@example.com"))
+            .unwrap();
 
         assert_eq!(pool.consume_usage("u1", 2).unwrap(), Some(1));
         assert_eq!(pool.consume_usage("u1", 2).unwrap(), Some(2));
@@ -1292,7 +1312,10 @@ mod tests {
             None,
             "the third call must be refused rather than counted and undone"
         );
-        let user = pool.find_user(&UserQuery::Id("u1".into())).unwrap().unwrap();
+        let user = pool
+            .find_user(&UserQuery::Id("u1".into()))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             user.usage.map(|u| u.count),
             Some(2),
@@ -1311,7 +1334,8 @@ mod tests {
     fn concurrent_consume_usage_never_exceeds_the_limit() {
         let tmp = TempDb::new("usage-race");
         let pool = Arc::new(Pool::open(&tmp.path(), 4).unwrap());
-        pool.insert_user(&sample_user("u1", "a@example.com")).unwrap();
+        pool.insert_user(&sample_user("u1", "a@example.com"))
+            .unwrap();
 
         const LIMIT: i64 = 10;
         const THREADS: usize = 4;
@@ -1337,7 +1361,10 @@ mod tests {
             LIMIT as u64,
             "exactly the limit must be granted across concurrent callers"
         );
-        let user = pool.find_user(&UserQuery::Id("u1".into())).unwrap().unwrap();
+        let user = pool
+            .find_user(&UserQuery::Id("u1".into()))
+            .unwrap()
+            .unwrap();
         assert_eq!(user.usage.map(|u| u.count), Some(LIMIT));
     }
 
@@ -1345,17 +1372,24 @@ mod tests {
     fn reset_usage_window_can_consume_the_first_unit() {
         let tmp = TempDb::new("usage-reset");
         let pool = Pool::open(&tmp.path(), 2).unwrap();
-        pool.insert_user(&sample_user("u1", "a@example.com")).unwrap();
+        pool.insert_user(&sample_user("u1", "a@example.com"))
+            .unwrap();
         pool.consume_usage("u1", 100).unwrap();
 
         assert_eq!(pool.reset_usage_window("u1", 5000, true).unwrap(), 1);
-        let user = pool.find_user(&UserQuery::Id("u1".into())).unwrap().unwrap();
+        let user = pool
+            .find_user(&UserQuery::Id("u1".into()))
+            .unwrap()
+            .unwrap();
         let usage = user.usage.unwrap();
         assert_eq!(usage.count, 1);
         assert_eq!(usage.reset_at, Some(5000));
 
         assert_eq!(pool.reset_usage_window("u1", 6000, false).unwrap(), 0);
-        let user = pool.find_user(&UserQuery::Id("u1".into())).unwrap().unwrap();
+        let user = pool
+            .find_user(&UserQuery::Id("u1".into()))
+            .unwrap()
+            .unwrap();
         assert_eq!(user.usage.unwrap().count, 0);
     }
 

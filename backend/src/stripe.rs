@@ -1,9 +1,9 @@
 use std::ffi::{c_char, c_int, c_long, c_void, CString};
-use std::sync::{Mutex, Once};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{ct_eq, hex_encode, hmac_sha256, random_uuid_v4};
@@ -35,10 +35,7 @@ pub enum SignatureError {
     NoSignatures,
     MissingTimestamp,
     InvalidTimestamp,
-    TimestampOutsideTolerance {
-        age_secs: i64,
-        tolerance_secs: i64,
-    },
+    TimestampOutsideTolerance { age_secs: i64, tolerance_secs: i64 },
     NoMatchingSignature,
 }
 
@@ -83,7 +80,11 @@ impl std::fmt::Display for StripeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StripeError::Transport(m) => write!(f, "stripe transport error: {m}"),
-            StripeError::Http { status, code, message } => match code {
+            StripeError::Http {
+                status,
+                code,
+                message,
+            } => match code {
                 Some(c) => write!(f, "stripe HTTP {status} ({c}): {message}"),
                 None => write!(f, "stripe HTTP {status}: {message}"),
             },
@@ -149,9 +150,14 @@ struct SigHeader<'a> {
 }
 
 fn parse_sig_header(header: &str) -> SigHeader<'_> {
-    let mut out = SigHeader { timestamp: None, v1: Vec::new() };
+    let mut out = SigHeader {
+        timestamp: None,
+        v1: Vec::new(),
+    };
     for part in header.split(',') {
-        let Some((k, v)) = part.split_once('=') else { continue };
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
         match k.trim() {
             "t" if out.timestamp.is_none() => out.timestamp = Some(v.trim()),
             "v1" => out.v1.push(v.trim()),
@@ -275,7 +281,10 @@ impl StripeMock {
             let id = rest.split('?').next().unwrap_or(rest);
             let id = percent_decode_basic(id);
             return match self.customers.get(&id) {
-                Some(email) => Ok(json::obj([("id", json::s(id)), ("email", json::s(email.clone()))])),
+                Some(email) => Ok(json::obj([
+                    ("id", json::s(id)),
+                    ("email", json::s(email.clone())),
+                ])),
                 None => Err(StripeError::Http {
                     status: 404,
                     code: Some("resource_missing".into()),
@@ -287,7 +296,9 @@ impl StripeMock {
             let id = rest.split('?').next().unwrap_or(rest);
             let id = percent_decode_basic(id);
             return match self.subscriptions.get(&id) {
-                Some(body) => json::parse(body.as_bytes()).map_err(|e| StripeError::Parse(e.to_string())),
+                Some(body) => {
+                    json::parse(body.as_bytes()).map_err(|e| StripeError::Parse(e.to_string()))
+                }
                 None => Err(StripeError::Http {
                     status: 404,
                     code: Some("resource_missing".into()),
@@ -511,7 +522,11 @@ impl StripeClient {
             ("customer".to_string(), customer.to_string()),
             ("return_url".to_string(), return_url.to_string()),
         ]);
-        let body = self.post(&format!("{API_BASE}/v1/billing_portal/sessions"), &form, None)?;
+        let body = self.post(
+            &format!("{API_BASE}/v1/billing_portal/sessions"),
+            &form,
+            None,
+        )?;
         Ok(PortalSession {
             url: body.get_str("url").map(str::to_string),
             id: body
@@ -524,9 +539,7 @@ impl StripeClient {
     fn get(&self, url: &str) -> Result<Json, StripeError> {
         #[cfg(test)]
         if let Some(mock) = &self.mock {
-            let guard = mock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let guard = mock.lock().unwrap_or_else(|e| e.into_inner());
             return guard.handle_get(url);
         }
         let auth = self.auth_header();
@@ -547,9 +560,7 @@ impl StripeClient {
     ) -> Result<Json, StripeError> {
         #[cfg(test)]
         if let Some(mock) = &self.mock {
-            let guard = mock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let guard = mock.lock().unwrap_or_else(|e| e.into_inner());
             return guard.handle_post(url, form);
         }
         let auth = self.auth_header();
@@ -591,7 +602,11 @@ fn http_error(res: &HttpResponse) -> StripeError {
         .and_then(|e| e.get_str("message"))
         .map(str::to_string)
         .unwrap_or_else(|| format!("request failed with status {}", res.status));
-    StripeError::Http { status: res.status, code, message }
+    StripeError::Http {
+        status: res.status,
+        code,
+        message,
+    }
 }
 
 struct CircuitState {
@@ -617,8 +632,10 @@ impl CircuitState {
     }
 }
 
-static CIRCUIT: Mutex<CircuitState> =
-    Mutex::new(CircuitState { consecutive_failures: 0, open_until: None });
+static CIRCUIT: Mutex<CircuitState> = Mutex::new(CircuitState {
+    consecutive_failures: 0,
+    open_until: None,
+});
 
 fn circuit() -> std::sync::MutexGuard<'static, CircuitState> {
     CIRCUIT.lock().unwrap_or_else(|e| e.into_inner())
@@ -642,7 +659,11 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
 }
 
 fn log_rate_limit(headers: &[(String, String)]) {
-    for name in ["stripe-ratelimit-remaining", "x-ratelimit-remaining", "ratelimit-remaining"] {
+    for name in [
+        "stripe-ratelimit-remaining",
+        "x-ratelimit-remaining",
+        "ratelimit-remaining",
+    ] {
         if let Some(v) = header_value(headers, name) {
             eprintln!("{{\"level\":\"warn\",\"msg\":\"stripe rate limit\",\"{name}\":\"{v}\"}}");
         }
@@ -668,8 +689,8 @@ fn send_with_retry(
                     circuit().record_success();
                     return Ok(res);
                 }
-                let wait = retry_after_ms(&res.headers)
-                    .unwrap_or_else(|| BASE_BACKOFF_MS << attempt);
+                let wait =
+                    retry_after_ms(&res.headers).unwrap_or_else(|| BASE_BACKOFF_MS << attempt);
                 last = Some(http_error(&res));
                 if attempt == MAX_RETRIES {
                     break;
@@ -771,7 +792,12 @@ fn global_init() {
     });
 }
 
-extern "C" fn write_cb(ptr: *mut c_char, size: usize, nmemb: usize, userdata: *mut c_void) -> usize {
+extern "C" fn write_cb(
+    ptr: *mut c_char,
+    size: usize,
+    nmemb: usize,
+    userdata: *mut c_void,
+) -> usize {
     let len = size.saturating_mul(nmemb);
     if ptr.is_null() || userdata.is_null() {
         return 0;
@@ -848,7 +874,10 @@ fn curl_message(code: c_int) -> String {
         if p.is_null() {
             None
         } else {
-            std::ffi::CStr::from_ptr(p).to_str().ok().map(str::to_string)
+            std::ffi::CStr::from_ptr(p)
+                .to_str()
+                .ok()
+                .map(str::to_string)
         }
     };
     text.unwrap_or_else(|| format!("curl error {code}"))
@@ -879,7 +908,14 @@ pub fn https_get(
     timeout_ms: i64,
 ) -> Result<(u16, Vec<u8>), StripeError> {
     let total = timeout_ms.clamp(1, c_long::MAX as i64) as c_long;
-    let res = request_with_timeout(Method::Get, url, headers, None, total, total.min(CONNECT_TIMEOUT_MS))?;
+    let res = request_with_timeout(
+        Method::Get,
+        url,
+        headers,
+        None,
+        total,
+        total.min(CONNECT_TIMEOUT_MS),
+    )?;
     Ok((res.status, res.body))
 }
 
@@ -893,7 +929,8 @@ fn request_with_timeout(
 ) -> Result<HttpResponse, StripeError> {
     global_init();
 
-    let c_url = CString::new(url).map_err(|_| StripeError::Transport("url has a NUL byte".into()))?;
+    let c_url =
+        CString::new(url).map_err(|_| StripeError::Transport("url has a NUL byte".into()))?;
     let user_agent = CString::new(format!(
         "skateboard-backend-rs/{} (libcurl)",
         env!("CARGO_PKG_VERSION")
@@ -935,7 +972,11 @@ fn request_with_timeout(
         let mut rc = curl_easy_setopt(h, CURLOPT_URL, c_url.as_ptr().cast::<c_void>());
         rc |= curl_easy_setopt(h, CURLOPT_USERAGENT, user_agent.as_ptr().cast::<c_void>());
         rc |= curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb as CurlCb);
-        rc |= curl_easy_setopt(h, CURLOPT_WRITEDATA, (&mut sink as *mut Vec<u8>).cast::<c_void>());
+        rc |= curl_easy_setopt(
+            h,
+            CURLOPT_WRITEDATA,
+            (&mut sink as *mut Vec<u8>).cast::<c_void>(),
+        );
         rc |= curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, header_cb as CurlCb);
         rc |= curl_easy_setopt(
             h,
@@ -962,7 +1003,9 @@ fn request_with_timeout(
         rc
     };
     if setup != CURLE_OK {
-        return Err(StripeError::Transport("failed to configure curl handle".into()));
+        return Err(StripeError::Transport(
+            "failed to configure curl handle".into(),
+        ));
     }
 
     // SAFETY: the handle is fully configured and still alive; perform blocks
@@ -975,9 +1018,12 @@ fn request_with_timeout(
     let mut status: c_long = 0;
     // SAFETY: CURLINFO_RESPONSE_CODE is a CURLINFO_LONG info, so the out
     // parameter must be a `*mut long` — which is exactly what is passed.
-    let rc = unsafe { curl_easy_getinfo(handle.0, CURLINFO_RESPONSE_CODE, &mut status as *mut c_long) };
+    let rc =
+        unsafe { curl_easy_getinfo(handle.0, CURLINFO_RESPONSE_CODE, &mut status as *mut c_long) };
     if rc != CURLE_OK {
-        return Err(StripeError::Transport("could not read response status".into()));
+        return Err(StripeError::Transport(
+            "could not read response status".into(),
+        ));
     }
 
     Ok(HttpResponse {
@@ -992,10 +1038,14 @@ mod tests {
     use super::*;
 
     const SECRET: &str = "whsec_test_secret";
-    const PAYLOAD: &[u8] = br#"{"id":"evt_1","object":"event","type":"checkout.session.completed"}"#;
+    const PAYLOAD: &[u8] =
+        br#"{"id":"evt_1","object":"event","type":"checkout.session.completed"}"#;
 
     fn signed_header(secret: &str, t: i64, payload: &[u8]) -> String {
-        format!("t={t},v1={}", expected_signature(secret, &t.to_string(), payload))
+        format!(
+            "t={t},v1={}",
+            expected_signature(secret, &t.to_string(), payload)
+        )
     }
 
     #[test]
@@ -1104,7 +1154,10 @@ mod tests {
         let now = signed_at + 301;
         assert_eq!(
             verify_signature(PAYLOAD, &header, SECRET, 300, now),
-            Err(SignatureError::TimestampOutsideTolerance { age_secs: 301, tolerance_secs: 300 })
+            Err(SignatureError::TimestampOutsideTolerance {
+                age_secs: 301,
+                tolerance_secs: 300
+            })
         );
     }
 
@@ -1115,7 +1168,10 @@ mod tests {
         let now = signed_at - 301;
         assert_eq!(
             verify_signature(PAYLOAD, &header, SECRET, 300, now),
-            Err(SignatureError::TimestampOutsideTolerance { age_secs: -301, tolerance_secs: 300 })
+            Err(SignatureError::TimestampOutsideTolerance {
+                age_secs: -301,
+                tolerance_secs: 300
+            })
         );
     }
 
@@ -1232,18 +1288,25 @@ mod tests {
     fn falls_back_to_error_type_when_code_is_absent() {
         let res = HttpResponse {
             status: 401,
-            body: br#"{"error":{"type":"invalid_request_error","message":"Invalid API Key"}}"#.to_vec(),
+            body: br#"{"error":{"type":"invalid_request_error","message":"Invalid API Key"}}"#
+                .to_vec(),
             headers: Vec::new(),
         };
         match http_error(&res) {
-            StripeError::Http { code, .. } => assert_eq!(code.as_deref(), Some("invalid_request_error")),
+            StripeError::Http { code, .. } => {
+                assert_eq!(code.as_deref(), Some("invalid_request_error"))
+            }
             other => panic!("expected Http, got {other:?}"),
         }
     }
 
     #[test]
     fn maps_a_non_json_error_body() {
-        let res = HttpResponse { status: 502, body: b"<html>bad gateway".to_vec(), headers: Vec::new() };
+        let res = HttpResponse {
+            status: 502,
+            body: b"<html>bad gateway".to_vec(),
+            headers: Vec::new(),
+        };
         assert_eq!(
             http_error(&res),
             StripeError::Http {
@@ -1256,7 +1319,11 @@ mod tests {
 
     #[test]
     fn decode_returns_json_for_2xx() {
-        let res = HttpResponse { status: 200, body: br#"{"id":"cus_1"}"#.to_vec(), headers: Vec::new() };
+        let res = HttpResponse {
+            status: 200,
+            body: br#"{"id":"cus_1"}"#.to_vec(),
+            headers: Vec::new(),
+        };
         assert_eq!(decode(res).unwrap().get_str("id"), Some("cus_1"));
     }
 
@@ -1284,7 +1351,10 @@ mod tests {
 
     #[test]
     fn ignores_an_http_date_retry_after() {
-        let headers = vec![("Retry-After".to_string(), "Wed, 21 Oct 2026 07:28:00 GMT".to_string())];
+        let headers = vec![(
+            "Retry-After".to_string(),
+            "Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+        )];
         assert_eq!(retry_after_ms(&headers), None);
     }
 
@@ -1297,13 +1367,19 @@ mod tests {
     #[test]
     fn finds_headers_case_insensitively() {
         let headers = vec![("Stripe-RateLimit-Remaining".to_string(), "7".to_string())];
-        assert_eq!(header_value(&headers, "stripe-ratelimit-remaining"), Some("7"));
+        assert_eq!(
+            header_value(&headers, "stripe-ratelimit-remaining"),
+            Some("7")
+        );
     }
 
     #[test]
     fn circuit_opens_after_three_consecutive_failures() {
         let now = Instant::now();
-        let mut c = CircuitState { consecutive_failures: 0, open_until: None };
+        let mut c = CircuitState {
+            consecutive_failures: 0,
+            open_until: None,
+        };
         c.record_failure(now);
         c.record_failure(now);
         assert!(!c.is_open(now));
@@ -1314,7 +1390,10 @@ mod tests {
     #[test]
     fn circuit_closes_after_the_cooldown() {
         let now = Instant::now();
-        let mut c = CircuitState { consecutive_failures: 2, open_until: None };
+        let mut c = CircuitState {
+            consecutive_failures: 2,
+            open_until: None,
+        };
         c.record_failure(now);
         assert!(c.is_open(now));
         assert!(!c.is_open(now + CIRCUIT_COOLDOWN + Duration::from_secs(1)));
@@ -1323,7 +1402,10 @@ mod tests {
     #[test]
     fn success_resets_the_failure_count() {
         let now = Instant::now();
-        let mut c = CircuitState { consecutive_failures: 0, open_until: None };
+        let mut c = CircuitState {
+            consecutive_failures: 0,
+            open_until: None,
+        };
         c.record_failure(now);
         c.record_failure(now);
         c.record_success();
